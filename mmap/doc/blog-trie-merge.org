@@ -1,0 +1,400 @@
+#+TITLE: 3-Way Trie Merge
+
+* Part I - Theorical Algorithm
+
+In my little corner of the Datacratic blog I'll be writting about random bits of
+interesting code that I happen to be working on at the moment. I'll start things
+off by jumping straight into the deep-end with a little algorithm that I spent
+several weeks perfecting. But before we get to the fun stuff, we need some
+context.
+
+** Context
+
+These last few months, I've been building an in-memory datastore capable of
+filling the needs of our real-time machine learning platform. It's built
+primarily on top of a trie that loosely resembles a Judy array[fn:1]. The
+datastore as a whole was designed to handle thousands of reads and writes in
+real-time.
+
+While the reads were easily scalable and could handle any loads we threw at it,
+the writes were not doing so well. The issue was that our MVCC scheme created a
+bottleneck at the root of the trie which had the effect of serializing all the
+writes. After a few failed attempts to tweak and prod the MVCC scheme, I decided
+to go for a more radical solution.
+
+The idea was to fork the entire trie into fast local copies that were free from
+the usual MVCC constraints. While this allowed our local writes to scale, they
+were not globally visible to all threads. To solve this little problem, I needed
+to take multiple concurrent fork-ed tries and merge them back into the one
+global trie. This is where a 3-way trie merge algorithm comes in handy.
+
+** Glossary
+
+We'll start things off with a few recurrent terms that we'll use throughout the
+article. First up, we'll associate a label to each of the 3 trie versions we're
+going to manipulate:
+
+#+BEGIN_EXAMPLE
+       |  |
+  base o  | Unrelated concurrent fork
+      /|  |
+     / | /
+    |  |/
+    |  *
+    |  |       +----------------+
+     \ |       | o fork         |
+  src \| dest  | * merge        |
+       *       | | trie version |
+       |       +----------------+
+#+END_EXAMPLE
+
+- *base*: The version of the trie where the fork took place.
+
+- *dest*: The current version of the trie that we want to merge into. This may
+  point to the same version as base in which case we're dealing with a 2-way
+  merge.
+
+- *src*: The local version which contains our modifications that we want to merge
+  into dest.
+
+Next up, here's the conventions we'll use for trie diagrams:
+
+#+BEGIN_EXAMPLE
+      |
+      |       Prefix
+      |
+      o       Node
+      |
+      |       Common Suffix
+      |
+   ___|___    Branching Point (BP)
+      |
+      *       Value
+     / \
+    /   \     Branches
+   o     o
+#+END_EXAMPLE
+
+- *Prefix*: The key prefix from the root that leads to the node. If the prefix
+  is empty then we're dealing with the root node.
+
+- *Common Suffix*: A key suffix appended to the node's prefix that is shared by
+  all childs and values of that node.
+
+- *Branching Point*: Bit position where 2 nodes' common suffix differ from each
+  other. We'll properly introduce this concept a bit later.
+
+To keep things simple, we'll only consider binary tries in this article.
+Supporting a larger alphabets should be pretty straightfoward.
+
+** High-Level Approach
+
+In my first attempts at writting this algorithm, I quickly realized that trying
+to handle all 3 trie versions at once would get complicated fast. Not only was
+it difficult to handle all the scenarios cleanly, the code for walking and
+comparing the trie versions also ended up being scattered throughout the
+algorithm. It was a mess.
+
+To avoid all these problems, we need a more unified framework for walking and
+comparing tries. We can start by dividing the problem into 3 phases:
+
+- *Diff*: search for differences between the base and src tries. When a
+  difference is spotted, it will delegate the actual modifications to the insert
+  or remove phase.
+
+- *Remove*: remove a branch or value of the base trie from the dest trie.
+
+- *Insert*: insert a branch or value of the src trie into the dest trie.
+
+Notice that all 3 phases only need to manipulate 2 out of 3 tries to do their
+work. This greatly simplifies the number of cases we have to worry about at any
+one time.
+
+Now that we've reduced the problem, we need a way to walk a pair of tries in a
+synchronized fasion while looking out for differences. this can be accomplished
+using a surprisingly powerful generic algorithm which will drive the core of
+each phases. Here's a lightly simplified version of the code:
+
+#+BEGIN_SRC c++
+  void merge(const Cursor& c0, const Cursor& c1)
+  {
+      // Figure out where the next difference occurs.
+      int32_t bitNum = commonPrefixLen(
+              c0.prefix() + c0.commonSuffix(),
+              c1.prefix() + c1.commonSuffix());
+
+      // Parse the content of the nodes
+      BranchingPoint p0(c0, bitNum);
+      BranchingPoint p1(c1, bitNum);
+
+      bool doMerge = false;
+
+      // Compare the nodes' branches
+      for (int branch = 0; branch < 2; ++branch) {
+          if (!p0.hasBranch(branch) && !p1.hasBranch(branch))
+              continue;
+
+          if (!p0.hasBranch(branch) || !p1.hasBranch(branch)) {
+              doMerge = true;
+              continue;
+          }
+
+          // Both branches are present.
+          Cursor newC0 = c0.advanceToBranch(p0, branch);
+          Cursor newC1 = c1.advanceToBranch(p1, branch);
+          merge(newC0, newC1);
+      }
+
+      // Compare the nodes' values
+      if (p0.hasValue() || p1.hasValue())
+          doMerge = true;
+
+      // Merge if necessary
+      if (doMerge)
+          mergeBranchingPoints(c0, p0, c1, p1);
+  }
+#+END_SRC
+
+This code sample makes heavy use of two utility classes: =Cursor= and
+=BranchingPoint=. =Cursor= allows us to easily move around the trie via the
+=advanceToBranch= function while keeping track of which node we're currently
+looking at along with its prefix and common suffix. =BranchingPoint= is used to
+parse the content of a node by grouping its elements into branches for the given
+bit number. As an example:
+
+#+BEGIN_EXAMPLE
+      |
+      o
+      |
+      |  <- 8
+      |
+    C *  <- 16
+     / \
+    /   \
+ A o   B o
+#+END_EXAMPLE
+
+Constructing a =BranchingPoint= on this node at the 8th bit will group all 3
+elements ~A~, ~B~ and ~C~ on the same branch. If we use the 16th bit instead,
+then ~A~ will be on branch 0, ~B~ on branch 1, and ~C~ on branch ~nil~ (meaning
+that it's a value). This abstraction makes it dead easy to compare the content
+of any two node.
+
+Now that the details are out of the way, we can look at the algorithm itself.
+It's input consists of two cursors which initially points to the root nodes of
+two trie versions. It starts by comparing the prefix and common suffix of both
+cursors to determine where they first differ. It then constructs a pair of
+=BranchingPoint= which are used to figure out what to do next.
+
+If a branch is present in both nodes, then we recursively invoke =merge= on that
+branch in both tries. If a branch is missing in one trie and present in the
+other then we know there is a problem and we ask the current phase to take an
+action via the =mergeBranchingPoint= function.
+
+Finally, we'll see later that the rules surrounding values differ in all three
+phases and, because of this, the generic algorithm always needs to call
+=mergeBranchingPoint= if a value is present in either tries.
+
+In a nutshell, the generic algorithm does a depth-first walk of a pair of tries
+and triggers a callback whenever it spots a difference between the two. The rest
+of the article will detail how each of the three phases make use of this
+algorithm to do a 3-way merge.
+
+** Diff Phase
+
+The neat thing about the generic algorithm of the previous section is that it
+does 90% of our diff-ing work for free. To see how, let's diff the following 2
+nodes:
+
+#+BEGIN_EXAMPLE
+       base         src
+        |            |
+        |            o
+        o            |
+    ____|_____BP_____|_____
+     A /              \ B
+      /                \
+     o                  o
+#+END_EXAMPLE
+
+When the generic algorithm evaluates the indicated branching points, it will
+find that the branch ~A~ in base is not present in src. This is due to the user
+removing the values of the ~A~ subtree from the src trie. Similarly, we'll
+notice that there is the branch ~B~ in src that is not present in base. This is
+due to the user adding values to the src trie that were not present in the base
+trie.
+
+In both cases, the generic algorithm will ask the current phase to take an
+action. For diff-ing this consists of inspecting the given =BranchingPoint=
+object and switching to the insert or remove phase as appropriate. That's it!
+
+It happens that there is a shortcut we can take if our trie implementation holds
+a certain property. The property we're looking for is that by looking at the
+root of a subtree we can tell whether something has been modified in that
+subtree.
+
+For diff-ing, it can be used to prune a subtree from the diff if src was not
+modified and is therefore identical to the equivalent base subtree. We can also
+tell when we're dealing with a 2-way merge if there are no modifications in
+dest. If this is the case then we know that the dest subtree is identical to the
+equivalent base subtree and we can merge the src subtree by swapping it with the
+dest subtree.
+
+In general, we're able to exploit 2-way merges in all three phases and it will
+have a dramatic impact on the performance of the algorithm. We'll explain how
+and why in a follow-up article.
+
+** Remove Phase
+
+In this phase we're trying to remove a base subtree or value from dest. There Is
+actually very little we need to do here beyond walking down the trie which is
+conveniently handled by our generic algorithm. Take the following two subtrees
+as an example:
+
+#+BEGIN_EXAMPLE
+      base         dest
+       |            |
+       |            o
+       o            |
+       |            |
+  ___B_*_____BP_____*_C___
+      /              \
+     /                \
+    o A                o
+#+END_EXAMPLE
+
+Here we would like to remove all the values in the subtree ~A~ from the dest
+subtree. The only problem is that another merge already beat us to it so there
+is not much to do.
+
+In general, we never have to look at the branches because the only relevant case
+is if both branches are present. In this case we need to dig deeper into those
+branches to make sure we don't delete values that were added to dest after the
+fork. It so happens that this is handled transparently by the generic algorithm.
+
+All we're left with are the values ~B~ and ~C~ and to merge them we need to
+lookout for conflicts. If ~B~ is equal to ~C~ then we can safely remove ~C~ from
+dest because the value we want to delete wasn't changed by another merge[fn:2].
+If ~B~ is not equal to ~C~ then we have two competing modifications of the same
+key and we need to decide which one will make it to the final trie.
+
+Since there is no realistic way to divine the intentions of the user, we just
+trigger a callback and let the user deal with the mess. Using callbacks also
+opens up interesting merge behaviours. As an example, if the values represent
+lists then we can resolve a remove conflict by only removing the elements in the
+base list that are present in the dest list. This would preserve any elements
+that were added to the dest list after the fork took place.
+
+Finally, if we're in a 2-way merge then we can just get rid of the entire dest
+subtree because it's the base subtree we're trying to remove.
+
+** Insert Phase
+
+In this phase, we're trying to insert a src subtree into dest. The simplest
+approach is to walk the src subtree and gather all its values which we would
+then insert one by one into the dest subtree. Unfortunately, for our trie
+implementation (and I suspect most trie variants) this is not very efficient as
+it requires that we do many successive modifications to the dest trie.
+
+What we really want is to look for situations where we can directly insert an
+entire subtree of src into dest. This is more efficient because moving an entire
+subtrees can be implemented by simply redirecting a pointer. As it turns out, we
+can take this shortcut in 2 distinct scenarios.
+
+The first scenario occurs when the branching point is at the end of the dest's
+common suffix and if we have a branch in src but not in dest.
+
+#+BEGIN_EXAMPLE
+    src          dest                         dest
+     |            |                            |
+     o A          |                            |
+     |            o C           |\             o  C
+     |            |          ___| \            |
+_____|_____BP_____|_____           \      _____|_____
+     |             \         ___   /          / \
+     |              \           | /          /   \
+    /                o D        |/          o A   o D
+   /                                        |
+  o B                                       |
+                                           /
+                                          /
+                                         o B
+#+END_EXAMPLE
+
+As the above trie diagram illustrates, there is already an empty branch in the
+~C~ node where we can conveniently insert ~A~ after trimming it's common suffix.
+
+Things get a little bit more tricky if the branching point is within the common
+suffix of a dest node.
+
+#+BEGIN_EXAMPLE
+         src          dest                         dest
+          |            |                            |
+          |            o C                          o E
+          |            |             |\             |
+          o A          |          ___| \            |
+     _____|_____BP_____|_____           \      _____|_____
+          |            |          ___   /          / \
+          |             \            | /          /   \
+          |              \           |/          o A   o C
+         /                o D                    |     |
+        /                                        |      \
+       o B                                       |       \
+                                                /         o D
+                                               /
+                                              o B
+#+END_EXAMPLE
+
+Here we have no empty branch we can use, so instead we'll create an entirely new
+node ~E~ with one branch going to the src node ~A~ and the other going to the
+dest node ~C~. ~E~'s common suffix will become the common prefix of ~A~'s and
+~C~'s prefix at the branching point.
+
+Depending on the trie variant, this may or may not take care of all the possible
+scenarios. The fallback in this case is to start inserting values manually which
+can lead to conflicts. Let's say we have a src value ~A~ and a dest value
+~B~. If ~A~ and ~B~ are equal then we don't need to insert anything because
+another merge beat us to it.
+
+If ~A~ and ~B~ are not equal then we have a problem: we can't tell if we have a
+conflict without looking at base to see if dest's value was changed after the
+fork. This can be solved by either always raising a conflict or updating the
+base cursor as we're walking down src and dest[fn:3].
+
+Finally, we're in a 2-way merge scenario if the dest subtree hasn't been
+modified. In this case we just swap the dest subtree with the src subtree.
+
+** Conclusion
+
+This covers all the high level details of the algorithm. Unfortunately, reality
+has a tendency to complicate things and there are many details I've deliberately
+omitted to keep things relatively simple. In the follow-up articles, we'll be
+looking into some of those thorny details like garbage collection and node
+simplification. We'll also look at the performance characteristics of our
+algorithm and whether they can be improved through parallelisation.
+
+Stay tuned!
+
+* Part II - Concrete Implementation
+# CoW & in placing
+# Node simplification
+# cutoff points -> 2-way merge
+# Key clustering per transaction as an opt
+# gc-ing (maybe too much right there)
+# Various insert opts (splitDest et al.)
+# Parallelization of the merge
+
+* Footnotes
+
+[fn:1] I'll go into more details regarding our choice of data structure in
+another article.
+
+[fn:2] This is not entirely true. As an example, if the value is a pointer to a
+mutable structure then the algorithm has no way of knowing if the structure has
+been modified or not. This can be solved by only allowing immutable structures
+into the trie.
+
+[fn:3] In our trie variant, we already needed to update the base cursor to
+detect 2-way merge scenarios so this decision was a no brainer.
+
+

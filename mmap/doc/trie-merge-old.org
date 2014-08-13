@@ -1,0 +1,345 @@
+#+TITLE: Trie 3-Way Merge
+
+* Definitions
+
+- *base*: The original unchanged trie that was forked.
+
+- *dest*: The CoW trie that originates from base and contains an unknown number of
+  modifications.
+
+- *src*: The in place trie used to make fast local modifications that was forked
+  from base and that we want to merge back into dest.
+
+- *corresponding X node*: Where X is either base or dest. Th node in trie X that
+  has a key prefix which is entirely contained within the key prefix of the node
+  we're currently working on.
+
+- *KV*: Key Value structure where the value may also be a pointer to another
+  node.
+
+- *KVList*: A set of sorted KV.
+
+- *Terminal node*: KVList that contains only KVs whose values are *NOT*
+  pointers. The number of KVs within a terminal node is unbounded.
+
+- *Branching node*: KVList that contains at least one KV whose value is a
+  pointer. Note that for the moment we only handle binary nodes so a branching
+  node will always have between 2 to 3 KVs where at most one will not be a
+  pointer. Note that the algorithm can be extended to handle n-ary node.
+
+- *Prefix of branching node*: common prefix of a branching node's KVList. Not to
+  be confused with a node's prefix which will be defined a bit later and used
+  way more often.
+
+- *PrefixBounds*: Class used to find all the KVs within a KVList that whose keys
+  are prefixed by a given key. All KVs of a KVList not present within these
+  bounds are considered as /falling off/ the prefix.
+
+#+TODO: Add pictures for prefixes, branch node and terminal node.
+
+* Misc Information
+
+- We have an exclusive lock on the trie while we're merging so no concurrent
+  writes will be allowed.
+
+- Modifications on the dest trie are done in place (after the initial CoW) to
+  speed things up. We remove all the in place markers from the dest trie once
+  we're done merging.
+
+- Because all the nodes are virtualised, we don't have direct access to their
+  internals. Instead we extract their components using =NodeOps::gatherKV()=
+  which returns a KVList with every value and pointer within the node. We then
+  parse it into the ~BranchingNode~ and ~PrefixBounds~ structures to be more
+  easily assimilated by the algorithm.
+
+* High level overview
+
+The easiest way to deal with the 3-way merge is to avoid working with the 3
+tries all at once. In order to do that, we split up the problem into 4
+subproblems that only requires manipulating 2 tries at any one time.
+
+- *Diff* (base <=> src): We look for differences between the base and src tries
+  and emit merge calls into the dest tries.
+
+- *Merge Remove* (base <=> dest): Remove a branch or value from the dest trie
+  that no longer exists within the base trie.
+
+- *Merge Insert* (src <=> dest): Insert a branch or value into the dest trie
+  that was added to the src trie.
+
+- *Rebuilding dest*: Still thinking about this one and it's a work in progress.
+
+These subproblems are further reduced into more fine-grained subproblems which
+only take as input one node from each tries. These nodes are represented using:
+
+- *the node's prefix*: a KV containing the full key fragment used to reach the
+  node along with a pointer to the node itself. These are represented in the
+  code as =basePrefix=, =srcPrefix= or =destPrefix=. Also not to be confused
+  with the prefix of a branching node.
+
+- *its values*: the KVList that composes the node. Remember that this can
+  represent either a terminal or a branching node.
+
+The general idea when subdividing each subproblems is to attempt to keep the key
+length of each node's prefix equal to each other. In other word, we want to be
+be at the same place (or as close as possible) in both trie so that we're
+working on the same subset of keys.
+
+If the prefixes are not equal, we move down the trie by extending the shortest
+node's prefix so that it matches the longest node's prefix. If this is not
+possible then we usually need to do something which is determined by which
+subproblem we're in.
+
+#+TODO: Could use a nice picture
+
+If we hit a terminal node while moving down one of the tries, then we can no
+longer continue to extend that node's prefix. We can't stop there either because
+each value within a terminal node can have a key of unbounded size that can
+reach arbitrarily deep within the other trie. In this case we usually use the
+PrefixBounds class to assign a subset of KVs to a branch of the other trie's
+node in order to be able to continue moving down at least one trie. (God I hope
+that made sense, if it doesn't, ask me for a picture).
+
+#+TODO: Could use a nice picture
+
+* Diff (base <=> src)
+
+This is the entry point of the algorithm where all 3 roots (base, src and dest)
+are passed as input. The dest node here is needed because while we don't use it
+for the diff-ing, we do need it to call the MergeRemove and MergeInsert
+subproblems. So as we move down the base and src tree we also keep track of the
+corresponding dest node to speed up the merge calls.
+
+The general rule for diff-ing are:
+
+- KV present in base but not in src => KV was removed
+- KV present in src but not in base => KV was added
+- KV present in base and in src but the values are not equal => KV was replaced.
+
+To simplify things, we treat replace as a MergeInsert subproblem. There's no
+real advantages to treat replaces as a separate subproblem and it's correct
+because we never work on both the base and src trie in either MergeRemove and
+MergeInsert. The downside is that we lose information to be provided to the user
+in the case of a conflict.
+
+Recursion cutoff points:
+
+- ~destPrefix == basePrefix && basePrefix != srcPrefix~:
+  - No changes have been made to this branch in dest since we forked src. This
+    effectively means that we're dealing with a 2-way merge.
+  - There's a modification in the src branch. Since there's a modification and
+    we're in a 2-way merge, we can simply use the src branch as the new dest
+    branch. This can be accomplished by simply returning the =srcPrefix= value to
+    the caller.
+
+- ~srcPrefix == basePrefix~
+  - There are no modifications in this branch of the trie so we just stop the
+    recursion. This can also be accomplished by looking at the state of the
+    =srcPrefix= pointer. If it points to an in place node then that node has
+    been modified.
+
+Note that outside the first condition, it's never safe to edit the dest trie
+from a diff-ing call because we simply don't yet know anything about the dest
+trie. Fortunately, the merge calls also contain their own cutoff points.
+
+Note that because of the first cut-off point, we also support 2-way merging
+by simply passing base as the dest input. Neato[fn:1].
+
+Finally here are the various subproblems when diff-ing the tries and the actions
+that needs to be taken in each cases. Note that general diffing rules are
+implied and will not be listed exhaustively. See the source code for an
+exhaustive list.
+
+- *One of the node's prefix is shorter then the other node's prefix*
+  (=diffDrillBranch()=): We begin to look for where the shorter prefix falls off
+  the longer prefix (note that this can work both ways because this check is
+  done using the common prefix) and we then attempt to travel down the branch of
+  the shorter prefix that matches the longer prefix. We emit merge calls for
+  extra or missing branches.
+
+- *Equal prefix with both node prefixes pointing to a branching node*
+  (=diffBranchBranch()=): We first check the prefix of the branching node (this
+  is not the node's prefix[fn:2]). If they are unequal then this is essentially
+  the same subproblem as described earlier (yet they can't share the same code
+  because we're not manipulating the same type of objects). If they are equal we
+  first diff the values on each branching node before we move down both
+  corresponding branches of the trie. We emit merge calls for extra or missing
+  branches.
+
+- *One of the node points to a terminal node while the other is a branching
+  node* (=diffBranchValue() and diffValueBranch()=): In this case we use the
+  PrefixBounds class to parse the terminal node. We then emit a merge call for
+  values that are outside the boundaries as well as diff-ing the value of the
+  branching node. We finally move down both branches of the branching node's
+  trie with the associated subset of KVs that corresponds to that branch.
+
+- *Both nodes are terminal* (=diffValueValue()=): We do a straight up diff on
+  both KVList and emit the associated merge calls.
+
+The recursion is driven by the =diff()= function which first looks for the
+cutoff points and then dispatches to the correct diff function according to
+which node is terminal and the length of each node's prefixes. The recursion
+will usually start with BranchBranch or DrillBranch calls before decaying into
+ValueBranch or BranchValue calls which will eventually decay into ValueValue
+calls. Cutoff points can be invoked for the DrillBranch, the BranchBranch or the
+ValueValue calls. The nodes involved in ValueBranch and BranchValue are never
+equal to each other (by their nature) and can therefor never trigger a cutoff
+point.
+
+* Merge Remove (base <=> dest)
+
+Merge remove follows the same pattern as diff-ing so I won't go into as much
+details. The input for this merge is the base branch or value to remove and the
+closest dest node we could get which matches the prefix of the base node.
+
+The general rules for merging are:
+
+- KV present in base but not in dest => The key is already gone so noop
+- KV present in dest but not in base => Key not marked for deletion so noop
+- KV present in both base and dest with equal values => Remove KV from dest
+- KV present in both base and dest with different values => Conflict
+
+A conflict essentially means that we're about to delete a KV that was modified
+in another fork. It's dealt by asking the user whether we should keep the src
+value or the dest value or just remove it. Note that the user is also free to
+modify whatever the value is referencing in order to adjust a nested data
+structure. Note that the conflict mechanism are still a work in progress so this
+paragraph will be updated as required.
+
+#+TODO: Update with final conflict mechanism.
+
+Also note that removing a KV from dest may require that we remove an entire
+branching node and push its prefix down to one of its remaining child.
+
+The recursion cutoff point is:
+
+- ~basePrefix == destPrefix~:
+  - Both branches are an exact match which means that we can remove the whole
+    subtree by replacing =destPrefix= with a null pointer.
+
+This cutoff points may seem redundant with the diff cutoff points but it's
+node. This is because a diff call should never walk down the same tree as a
+merge call. So while a base and dest node may be different higher up in the
+tree, some of the lower subtrees may still be equal and therefor untouched.
+
+The rest of the algorithm follows the same general layout as the diff algorithm
+except for the actions taken which follow the general rules outline earlier.
+
+Note that while the recursion structure is very similar, there can be very
+little code re-use between diff and mergeRemove. The reason for this is fairly
+obvious when you compare the general rule for merging and diffing. Both are
+looking for different things and taking vastly different actions on them
+(calling mergeXxx versus modifying the structure of the trie).
+
+It could be possible to abstract the recursion structure and implement the
+various subproblems in them. I personally think that the code is confusing
+enough as it is and abstracting the inputs of each call would be even more
+confusing and error prone. Getting the names right (base vs src vs dest) is
+already very error prone. It would also be awkward to implement merge insert
+because of its slightly different recursion structure. Could be worth a
+trie[fn:3].
+
+* Merge Insert (src <=> dest)
+
+Merge insert follows the same pattern as diff and merge remove with a small
+exception which will be detailed later. The input is the branch in src that we
+want to insert and the closest dest node we could get which matches the prefix
+of the src node. We also keep a corresponding base node which we update as we're
+moving down the trie.
+
+The general rules for merging are:
+
+- KV present in src but not in dest => Insert the KV in dest
+- KV present in dest but not in src => KV not marked for insertion so noop
+- KV present in src and in dest with equal values => value already there so noop
+- KV present in dest and in src with different values => conflict
+
+A conflict essentially means that we're about to overwrite an insert made by
+another fork of the base trie. The conflict resolution is close enough to merge
+remove's resolution that it's not worth going into further detail.
+
+The recursion cutoff point is the same as cutoff remove which is why we need and
+maintain a base pointer in the merge insert recursion.
+
+Finally, inserting a branch with an arbitrary key into the trie isn't something
+that our current trie implementation supports very well (leafs are supported but
+not branches). The problem is that if we move too far down into the trie, it's
+no longer possible to insert a branch because we no longer have access to the
+node we need. For this reason, the dest node prefix must never be greater then
+the src node prefix.
+
+This restriction, forces us to change the recursion pattern a bit. The
+=mergeInsertDrillBranch()= functions have been replaced by a
+=mergeInsertSplitDest()= function whose job is to split the prefix of a dest
+node in two in order to introduce a new branching node which will hold a branch
+from the dest trie and a branch from the src trie. The operation is explained in
+greater detail within the source code and is re-used quite a bit when we detect
+that the dest node prefix might overtake the src node prefix.
+
+* Rebuilding dest
+
+Merge functions are only called on subtrees of the tries which means that after
+the diff is finished we're left with a variety of modified subtrees spread out
+all over the trie. These subtrees need to be linked back to the original dest
+trie somehow in order to return a coherent trie back to the user.
+
+Remember that, in order to preserve the MVCC guarantees, we have to CoW all the
+parents of a node that we end up writing to. So not only do we have to stitch
+all the various modified subtrees back into a single trie but we also have to
+make sure that all the parents of those subtrees are properly CoW-ed as well.
+
+To do this, we pre-emptively CoW the dest nodes as we are diff-ing. Remember
+that while we're moving down the base and src trie, we're also making sure that
+we move down the dest try in such a way that the dest node's prefix will be
+entirely contained within both the src and base node's prefix.
+
+By pre-emptively CoW-ing the dest nodes, we can also change their state to in
+place. This means that the dest nodes we're passing to the merge functions will
+be in place and already linked up to a chain of in place nodes leading up to the
+root of the trie. So any modifications made by the merge functions will
+therefore be automatically part of the new in place trie.
+
+Note that I also don't believe we'll be making any superfluous copies because
+we're only advancing the dest node after we've checked our cutoff points. This
+means that we only make copies when we've detected that there's at least some
+form of modification in the subtree that we're pushing into[fn:4].
+
+This leaves us with a in place trie at the end off the diffing that contains
+both nodes from the dest trie and the src trie. Before we return to the user, we
+have to make sure that all the nodes within the trie are changed back to CoW in
+order to avoid modifying the base trie of another ongoing fork.
+
+* Garbage Collection
+
+For the dest and src tries, garbage collection is pretty straight forward. Src
+is only ever visible from a single process and we can therefor just deallocate
+the nodes right away without any fuss. The dest trie will only ever have one
+merge call applied to it which means that we can use the regular gc list
+mechanism to clean it up.
+
+Base more complicated to understand yet much easier to implement. First we have
+to understand that dest is essentially base with a series of modifications made
+to it. This means that as we're modifying dest, we're modifying in part nodes
+that belongs to base and new nodes that were created since base. So every time
+we change a node in dest that belongs to base, we will clean it up using the
+regular gc list mechanism.
+
+So, like promised, base clean up is easy to implement because we're not doing
+anything. It's clean up will happen as part of the dest clean up which, as we've
+mentionned before, just makes use of the regular gc list mechanism.
+
+* Footnotes
+
+[fn:1] I only became aware of this while writing article/text/essay/blog
+post/whatever makes you happy.
+
+[fn:2] I'm insistent about this because I've confused the two several times
+which lead the many unpleasant headaches.
+
+[fn:3] Couldn't resist the pun. Sorry :)
+
+[fn:4] That's not entirely true. If a value is modified before being changed
+back to it's original value then we'll detect that there's a change somewhere in
+the subtree but the diff-ing won't find anything.
+
+

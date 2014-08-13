@@ -1,0 +1,13 @@
+Design of mmap trie
+
+Memory Allocation
+-----------------
+
+We can use the boost::interprocess stuff underneath... this allows us
+to do things like put multiple named objects in the file, etc without
+getting in the way too often.
+
+We can implement a custom memory manager when it makes sense.
+
+Growing the memory
+

@@ -1,0 +1,2607 @@
+
+#+LINK: mmap file:~/code/platform/mmap/
+
+* Trie
+** Trie Notes
+*** IndirectNode 						       :note:
+    [[mmap:mmap_trie_node_impl.h::217][mmap_trie_node_impl.h]]
+
+    Acts like a pointer to a node.
+    Also ensures that the memory area is pinned when the node is accessed.
+    -> This should also trigger the RCU lock
+
+    Note that I believe all TriePtr has to go through this at some point otherwise there's a bug with
+    the key formatting. See the question.
+
+**** DONE Figure out the relation between that and TriePtr
+     - State "DONE"       from "ONGOING"    [2012-02-23 Thu 12:11]
+     - State "ONGOING"    from "TODO"       [2012-02-23 Thu 12:11]
+     - State "TODO"       from ""           [2012-01-16 Mon 11:13]
+
+     I think TriePtr is a wrapper for IndirectNode since the IN is pretty user unfriendly (see unpin).
+
+     => TriePtr represents an offset + metadata for accessing the node.
+
+     IndirectNode does the translation from offset to actual pointer in a safe manner. To do that it
+     has to extract the metadata out of the TriePtr.
+
+*** IndirectOpsBase 						       :note:
+    [[mmap:mmap_trie_node_impl.h::353][mmap_trie_node_impl.h]]
+    Ops for IndirectNode that handles memory allocation.
+
+*** GCList = Transaction for an op				       :note:
+*** Sizes (in bytes) 						       :note:
+    KeyFragment = 8(key) + 4(keySize)
+    TriePtr = 8 {4(type) + 60(ptr)}
+
+*** Insertion logic						       :note:
+    This logic is triggerd when calling copyAndInsertLeaf.
+
+    * Insert into a leaf:
+      - InlineNode -> makeDoubleLeaf -> makeSparseNode
+      - SparseNode ->
+	- if not full -> just add
+	- else -> makeMultiLeaf
+
+    * Insert into binary:
+      - same commonPrefix? (on node or after the node).
+	- no suffix? -> set value
+	- *** ASSUMES THAT THE NODE ALWAYS HAS BOTH CHILDREN ***
+	  + Simply remedied by calling makeMultiLeaf and shoving the result in the empty node.
+	- else -> addLeaf -> copyAndInsertLeaf (back to the top)
+      - else? (between node and parent).
+	- Create new BinaryNode and change our parent.
+	- If parent.key == key?
+	  - set value and return
+	    * This could be a problem because it doesn't set one of the children.
+              Making the earlier warning kaboomboom
+	- else? makeLeaf and set the result in children.
+
+    * makeLeaf:
+      - Fits in Inline? -> make that
+      - else? -> BasicKeyedTerminalOps
+
+    * makeMultiLeaf:
+      - n == 1? -> makeLeaf
+      - n == 2..4? -> SparseNode
+      - Fits in CompressedNode? -> make that
+      - else
+	- find common prefix -> BinaryNode
+	- makeMultiLeaf(left,right)
+
+*** Deletion logic						       :note:
+    Bottom up logic
+
+    delete()
+    1. Is leaf to delete on node?
+       - no? delete(child)
+    2. node empty?
+       - add node to gc & return null path
+    3. doDelete
+       - makeMultileafMight help to do the actual copy and create the right leaf.
+	 - Should never return a BinNode because we're just getting smaller.
+	 - There's a perf hit though because we might not need all that complexity
+       - BinaryNode has it's own logic as usual
+
+
+    TerminalNode.doDelete()
+    - n == 1 -> return NULL;
+
+    SpareNode.doDelete()
+    - Create the KV array without the bad value.
+    - makeMultiLeafNode
+
+    CompressedNode
+    - n <= 5 -> makeMultileafNode
+    - n > 5 -> copy and delete.
+
+    BinaryNode (size() includes the value)
+    - assert(hasValue || branchCount == 2)
+    - assert(hasValue && branchCount >= 1)
+    - hasValue?
+      - delete value?
+	- assert(size() > 1)
+	- hasOnlyOneBranch?
+	  - mergeChild with parent
+	  - reclaim this binary node.
+	  - return
+	- size() > 5?
+	  - copy & delete value
+	  - return
+    - size() <= 5?
+      - Collect children of both branches
+      - Delete the KV to delete.
+      - makeMultiLeaf with the rest (4 or less).
+      - reclaim this binary node and all children (should never be more then 2).
+      - return
+    - doDelete(child)
+      - copy and set the new child
+
+** Trie Questions
+*** DONE 64+ bytes alignment? Really?				   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-16 Mon 14:14]
+    - State "ONGOING"    from "TODO"       [2012-01-16 Mon 12:02]
+    IndirectOpsBase defines it the alignment template arg as alignof(Repr).
+    The Log2<> is only used on the alignment and is defined for up to 2^12
+    Will gcc actually detect page sizes and align large structs to them automatically?
+    That'd be awesome.
+
+    => Turns out no, alignof won't return something that big.
+    Something around future-proofing or something.
+
+*** DONE Bug in IndirectNode(TriePtr,...) constructor?		   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-17 Tue 09:46]
+    - State "ONGOING"    from "TODO"       [2012-01-16 Mon 12:02]
+
+    It grabs the TriePtr::data then calls decodeOffset on it.
+    Problem is that decodeOffset expeccts the ptr to already shifted with metadataBits.
+    I doubt it already is which leads to over shifting
+
+    eg. metadatbits = 2, alignmentBits = 4
+    1111 0000 -> 0011 1100 -> 1100 0000 -> we lost 2 bits that should have been kept.
+
+    On the other hand, when converting IndirectNode to a TriPtr, it calls encodePtr to build
+    offset which has the desired shape, so if all TriPtr are built like this then no problemo.
+
+    => yes TriePtr is always shifted according to the metabits so no bugs here.
+
+*** DONE Why node_impl.cc if everything is in node.cc?		   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-17 Tue 09:45]
+    - State "ONGOING"    from ""           <2012-01-16 Mon 12:00>
+    - FROM: [[file:~/code/platform/mmap/mmap_trie_node_impl.cc::/*%20mmap_trie_node_impl.cc][file:~/code/platform/mmap/mmap_trie_node_impl.cc::/* mmap_trie_node_impl.cc]]
+
+    Get rid of the file or do some refactoring?
+
+    => Doesn't really matter, just ignore it and move on.
+
+*** DONE TriePathEntry: Why entryNum:38 & bitNum:23?		   :question:
+    Seems a bit excessive seeing that:
+
+    2^38 = 274877906944
+    2^23 = 8388608
+
+    If I'm reading this right, entryNum really shouldn't be bigger then 2^16 and bitNum no more then 64 (2^6)
+    Meaning that we can pack this into a 32 bit int.
+
+    => entryNum: Also indexes all the child nodes so no it's not absurdly large.
+    => bitNum: Should eventually also work on string keys so again, it's fine.
+
+*** DONE TriePath: compact_vector template args seems wrong.	   :question:
+    typedef ML::compact_vector<TriePathEntry, 2, uint32_t> TriePathBase;
+
+    A TriePathEntry is 2*uint64_t. Either the arguments are plain wrong or I just don't get what they represent.
+    Could reverse compact_vector someday...
+
+    => compact_vector works on 2 modes (external and internal - there's no mix).
+    The 2nd arg means that the object will keep enough space for n objects internally.
+    The 3rd arg defines the size of the size variable in the vector.
+    Essentially, there's a tradeoff between the switch from external to internal mode in how space is used.
+
+*** DONE Delete is implemented with copyAndReplace?		   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-26 Thu 14:52]
+    - State "ONGOING"    from ""           <2012-01-26 Thu 14:30>
+    - FROM: [[file:~/code/platform/mmap/mmap_trie_binary_node.h::static%20TriePath][file:~/code/platform/mmap/mmap_trie_binary_node.h::static TriePath]]
+
+    If so, then it could make rebalancing a bit hard because you only see the current node.
+    Do we even do deletes? Do we plan on ever doing deletes?
+
+    => Nop, there's simply no deletes right now. Makes my life easier.
+
+*** DONE Is DenseNode a failed experiment			   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-26 Thu 14:52]
+    - State "ONGOING"    from ""           <2012-01-26 Thu 14:31>
+    - FROM: [[file:~/code/platform/mmap/mmap_trie_binary_node.h::static%20TriePath][file:~/code/platform/mmap/mmap_trie_binary_node.h::static TriePath]]
+
+    Looks like it because it's not used anywhere and doesn't even have any childrenSize
+    entries. Sizes could be calculated by looking at the children but that's kinda bad in
+    the case where it's DenseNode all the way down.
+
+    Also the hasValue and bits member should be shoved in the MD.
+
+    => It's an unfinished experiment so do what you will with it.
+    Note that we should at least keep the total size of the node to speed up size calc.
+
+*** DONE How many items do we expect to shove in the tree?	   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-26 Thu 14:54]
+    - State "ONGOING"    from ""           <2012-01-26 Thu 14:38>
+    - FROM: [[file:~/code/platform/mmap/mmap_trie_node.h::}%3B][file:~/code/platform/mmap/mmap_trie_node.h::};]]
+
+    2^(64-16)? 2^(64-8)? 16 seems acceptable and I can do fun stuff with those extra bits.
+
+    => It's fine to make these assumption and maybe even more. If the top nodes
+    can't fit the data then we'll just use binary nodes at the top or another special node
+    type to relax the sizes.
+
+*** DONE Root of the Trie is going to ping-pong all over the place :question:
+    - State "DONE"       from "ONGOING"    [2012-01-30 Mon 12:46]
+    - State "ONGOING"    from ""           <2012-01-27 Fri 09:57>
+
+    Logic steps:
+    1. Everytime you add a node, you need to modify its parent because you made a copy of the leaf node.
+    2. In order to modify the parent, you also have to make a copy of that node which that you have
+       to update its parent as well.
+    3. Repeat 2. until you're at the root.
+
+    This means that everytime you modify anything in the tree, you'll move the root.
+    That thing will just ping pong all over the place.
+    Now is that a real problem?
+    - Might hurt the cache performance (it would be nice if the root was in one place)
+      + Could be solved by making a special atomic root node.
+       	+ That node would be tricky to write though if the keys aren't evenly distributed in the space
+	  which is the case for offsets and memory addresses.
+
+    It's even worst then just that. Since every modification of the root will eventually
+      end up at the root, that means that we need to cas the root pointer.
+    If this cas fails, you're screwed. There's no way to tell where in the tree the
+      a potential conflict might have occured which means that we gotta trash a whole line of
+      modifications.
+    This means that in the end there can only be one ongoing modification at a time.
+      everything else is just a waste of processor time and we might as well shove a mutex on the thing.
+
+    We'd need to make this concurrency check at every split node in the tree in order to detect this
+      as rapidly as possible. Look at the parallel count tree in the art book.
+
+    A good solution for that stems from the fact that TriePtr can be atomically manipulated.
+      So if the only thing you need to modify is the child of a node, then we can simply
+      cas the pointer and move on to better things. Since you're not making a copy you solve lots
+      of problems in one go.
+    There is the issue of the childrenSize which also has to be propagated upwards and screws up the
+      whole scheme... damn it... I *think* that it's possible to prove that this is ok.
+      Essentially, the linearlization point for the existence of the node given the operations
+      that require the size, happens at the moment where the size is updated for that particular
+      subtree. That should be fun to prove and maintain in future versions...
+      Might lead to inconsistencies between ops that require the size and ops that don't. God forbid
+      there's a op that mixes the two... *shivers*
+
+    => It is an actual problem but using cases within the tree is not gonna fly.
+    The reason is that when reading the tree you want to have a snapshot of it and you want
+    that snapshot to remain consistent. This is one hell of an important requirement which
+    complicates things.
+
+    So the alternative is that when you fail to change the root, you walk back down your tree
+    and progressively check for what's changed and what hasn't. Then you only have to redo
+    the stuff that's changed and not the stuff that hasn't.
+
+    I think the best way to get that information is using the GcList since most the nodes are
+    going to have to go through there at one point or another.
+
+    I also think that this somehow limits us to bottom-up modifications of the tree.
+
+*** DONE Nodes don't seem to be reclaimed right now		   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-27 Fri 15:38]
+    - State "ONGOING"    from ""           <2012-01-27 Fri 13:58>
+
+    When a binary node makes a copy of himself, the old copy doesn't seem to be added to any
+    lists for reclamation.
+    Only the new nodes seem to be added to GcList.
+    Which is nice to make a transaction but we don't want the old nodes to stick around forever.
+
+    => GcList::commit() takes a path which should be the old path containing all the copied nodes.
+    All the nodes there are then defered-deleted.
+
+*** DONE Fine grain pin/unpin in trie nodes			   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-31 Tue 16:30]
+    - State "ONGOING"    from ""           <2012-01-31 Tue 11:48>
+    - FROM: [[file:~/code/platform/mmap/mmap_trie_binary_node.h::node.unpin()%3B][file:~/code/platform/mmap/mmap_trie_binary_node.h::node.unpin();]]
+
+    Is there a point to the fine grain pin/unpin stuff in every node operations?
+    If we want a complete snapshot of the tree when doing an operation, isn't it better
+    to just do one CS at the top Trie method level?
+
+    => Yes it's done at the very top in most cases and because of that subsequent pins and unpins
+    end up in a thread local lookup which are pretty fast.
+
+*** DONE Maintaining multiple timestamped trie versions		   :question:
+    - State "DONE"       from "ONGOING"    [2012-02-10 Fri 16:07]
+    - State "ONGOING"    from ""           <2012-02-06 Mon 10:39>
+
+    Conversation with nick at launch mentionned something about handling keeping multiple
+    versions of the trie and whether we truly delete a node or just make it no longer relevant
+    from a certain point.
+
+    Now this isn't too complicated to handle (just keep a list of roots with a timestamp and fiddle
+    with the GC to only remove stuff in the case of failed transactions).
+
+    What I was wondering is whether there are other requirements like this that I might not know.
+    It would be usefull to guide some of the development.
+
+    => Ignore this for now, will come later in the future
+    Supposed to be difficulties related to garbage collection.
+
+*** DONE Writes seem pretty slow				   :question:
+    - State "DONE"       from "ONGOING"    [2012-03-05 Mon 10:23]
+    - State "ONGOING"    from ""           <2012-02-06 Mon 11:20>
+
+    A completely non-scientific observation suggests that writes to the trie are pretty slow.
+    Because of RCU this isn't a super big problem and we still have a the concurrency issue to fix
+    while modifying the trie.
+
+    Still even on single-threaded tests, modifications don't seem very fast.
+    Will need to optimize the living crap out of this.
+
+    => They are, need to do some general profiling and opt.
+
+** Trie Tasks
+*** DONE Create RAII proxy for the returned object of IndirectNode     :task:
+    - State "DONE"       from "ONGOING"    [2012-03-05 Mon 10:23]
+    - State "ONGOING"    from "TODO"       [2012-03-05 Mon 10:23]
+    - State "TODO"       from "ONGOING"    [2012-01-26 Thu 16:12]
+    - State "ONGOING"    from "DONE"       [2012-01-18 Wed 13:19]
+    - State "DONE"       from "ONGOING"    [2012-01-16 Mon 14:17]
+    - State "ONGOING"    from "TODO"       [2012-01-16 Mon 14:17]
+    - State "TODO"       from ""           <2012-01-16 Mon 11:51>
+
+    Looks WAAAY to easy to forget to call unpin() or to make a read after unpin().
+    A nice RAII proxy object could be nice since it would scope the unpin() call.
+    At the very least replace operator* to make it more explicit.
+
+    => pin/unpin stuff is overly complicated and needs an overhaul.
+    => Actually there is automatic unpinning within the Indirect node. The problem is
+    that we can't call one of the memory allocator's method with the region pinned.
+    While we could try to scope the node accesses to make it work, in practice this
+    would be a real mess.
+    See the binary node's copyAndInsert and copyAndRemove methods. These are large and
+    complicated. Trying to scope our node accesses would make the code very hard to read.
+
+*** DONE Double unpin for the node.					:bug:
+    - State "DONE"       from "ONGOING"    [2012-02-14 Tue 09:54]
+    - State "ONGOING"    from "TODO"       [2012-02-14 Tue 09:54]
+    - State "TODO"       from ""           <2012-01-16 Mon 12:27>
+    - FROM: [[file:~/code/platform/mmap/mmap_trie_binary_node.h::node.unpin()%3B][file:~/code/platform/mmap/mmap_trie_binary_node.h::node.unpin();]]
+
+      Other call is here:  [[mmap:mmap_trie_binary_node.h::170][nopde.unpin()]]
+
+      => It's fine. The thing is re-pinned everytime it's dereferenced but needs to be
+      unpinned for every call otherwise the memory allocator complains.
+
+*** TODO Add support for N-ary node				       :task:
+    - State "TODO"       from ""           [2012-01-16 Mon 14:20]
+
+    Note, this depends on memory alloc supporting bigger chunk size then 64.
+
+    Essentially a Binary node but with 4+ elements in it. (start with 4 and worry about more later).
+    The idea is to save space by reducing the amount of booking keeping information.
+      - Binary node: 6*8 bytes BK + 8*2 children => (N/2)*6*8
+      - Nary node: 6*8 BK + M*8 children => (M/N)*6*8
+
+    There are tests somewhere that could be run to check the amount saved.
+    Watch out for rebalancing with other Nary or binary nodes.
+
+    Look for balancing schemes in B-Trees and R-Trees or any other N-ary trees.
+
+    Load balancing could be: loadFactor = pop(node.leftHalf) / pop(node.head)
+    -> with a treshold of 0.75
+
+*** TODO Recursive DataStructures 				       :task:
+    - State "TODO"       from ""           [2012-01-16 Mon 14:41]
+
+    The idea is that we can manipulate a Trie within a Trie using the same transaction(GCList).
+
+    This will be useful once we create a set and vector interface to the trie. We will
+    then be able to use these as values for a trie.
+
+    Note that before we can do this, we need to be able to persist the GcLock within the trie.
+    The reason is that each trie has it's own GcLock, which means that we currently can't
+    build a trie object every time it is accessed without running into concurrency problems
+    (hard to debug ones as well).
+
+    So what we have to do is persist the GcLock along side the trie root so that we can load
+    both at once and have a globally visible lock.
+
+*** DONE Node types with less then 64 bytes			       :task:
+    - State "DONE"       from "ONGOING"    [2012-02-13 Mon 08:49]
+    - State "ONGOING"    from "TODO"       [2012-02-13 Mon 08:49]
+    - State "TODO"       from ""           <2012-01-27 Fri 09:22>
+
+    Now that we have smaller node sizes, it would be nice if we didn't have to
+    allocate a full 64bytes sparse node to fit only a single leaf.
+
+    => We never did have to do that. See KeyedTerminalLeafNode and InlineLeafNode.
+
+*** DONE Implement delete op					       :task:
+    - State "DONE"       from "ONGOING"    [2012-02-06 Mon 11:49]
+    - State "ONGOING"    from "TODO"       [2012-01-27 Fri 13:11]
+    - State "TODO"       from ""           <2012-01-27 Fri 09:37>
+
+    See delete logic notes.
+
+    UhOh! When deleting the value of a BinaryNode that has only one child, we want to simply get rid of the node.
+    Problem is that in order to do that we have to fix the prefix of the keys of the child node.
+    Can't see any way to do that currently. Might need a new operator.
+
+    Options:
+    - Recurse the delete down and have the node detect this situation
+      + TERRIBLE IDEA: have to modify every leaf node class for this.
+    - Remove the value and leave the node where it is
+      + Wasted space = DOOOM, decrease in efficiency = DOOOOOM! (there's a couple of extra Os).
+    - Create a new op where each leaf is capable of adding a prefix to their keys.
+      + By the process of elimination: WINNAR!
+      + Gotta be careful with inline node and compressed node. They can't simply cange their keys.
+      + Sparse node, keeps key related data in it's MD, could be a problem.
+
+    UhOh! At the MutableTrie level, we have to call replaceSubtree at some point (to change the root).
+    The problem is that it takes 2 path: A path from the root to the a node where the modifications
+    start occuring and a path from that last one to the end of the modifications.
+
+    Now the problem is that unlike insert, it's not super clear where I should stop the first path. The
+    reason is that to keep the tree balanced I may have to change a BinNode that may not look like
+    it's directly involved in the removal.
+
+    Options:
+    - Let the removeLeaf op handle everything and pass an empty path to the replaceSubtree method
+      + Short-term: Everything is sunshine and unicorns.
+      + Long-term: When we're going to fix the cas issue at the root, we'll want to start undoing
+	that path. With this solution we'll have to add this undo logic in the delete op.
+    - find the key and back up the path an arbitrary number of nodes (2).
+      + The backing up is totally arbitrary since in some cases it's once and other it's twice.
+	It might even be more then that in the future.
+      + On the other hand we do have a path in the MutableTrieVersion that can use the same logic
+	as insert to back-off in the case of concurrence at the root of the trie.
+
+    Path problems:
+    Current problem is that placing a path to something that doesn't exist is somewhat of an issue.
+    Returning a TriePtr instead would be just as good except that if we're deleting the root
+      replaceSubtree will return an empty TriePath even if it didn't fail! somewhat of an issue.
+    I think jeremy's idea of returning a path to the element just after the element we deleted
+      will be the best option. Do that.
+    Actually that idea sucks because in order to point to the next element we could have to back-out
+      of the tree we're operating in. Don't do that...
+
+*** DONE RemoveLeaf: Uni-branch no value bin edge case.		       :task:
+    - State "DONE"       from "ONGOING"    [2012-02-06 Mon 10:43]
+    - State "ONGOING"    from "TODO"       [2012-02-06 Mon 10:43]
+    - State "TODO"       from ""           [2012-02-03 Fri 11:49]
+
+    Check if we're deleting a branch with only 1 element in it.
+    If that's the case, delete the bin node and push the prefix down.
+
+    This can, not, fall within the MAX_LEAF thing if the other node is a compressed node with
+    MAX_LEAF+1 nodes in it.
+
+*** TODO Automagic Transaction/GcList				       :task:
+    - State "TODO"       from ""           <2012-01-31 Tue 16:35>
+
+    The idea is that instead of keeping track of everything added and/or removed from the trie,
+    we would have a function that could figure it all out on its own.
+
+    Should come in handy when we deal with the cas-root problem.
+
+*** DONE Concurrency bottleneck at trie root			       :task:
+    - State "DONE"       from "ONGOING"    [2012-02-10 Fri 16:01]
+    - State "ONGOING"    from "TODO"       [2012-02-06 Mon 12:05]
+    - State "TODO"       from ""           <2012-02-06 Mon 11:50>
+
+    Currently when multiple thread are modifying the the trie they must all eventually
+    replace the root. This is done using a CAS which meant that one thread succeed and
+    all the other threads fail and must start over again.
+
+    The idea is instead of forcing every thread to start over from scratch, we can simply
+    reconstruct the path that conflicted with the last CAS and try again.
+
+    Concretely this means that in replaceSubtree, if setRoot fails, we traverse the pathToNode
+    path looking for a conflict. If it all conflicts then return a false and start from scratch.
+    Otherwise re-use replaceSubtreeRecursive in an intelligent manner and try again.
+
+    Legend:
+    - old: Path to newSubtree that we're trying to replace (input = pathToNode).
+    - attempt: Path to newSubtree that replaces old
+    - cur: Path to the key after the call to setRoot failed.
+    - common: Common part of cur and attempt paths. Stops at newSubtree
+    - redo: Part of the cur path that needs to be replaced.
+
+    Mostly plowed through the spagheti mess of the TriePath.
+
+*** DONE Mesure performance gain of root bottleneck fix		       :task:
+    - State "DONE"       from "ONGOING"    [2012-02-14 Tue 14:08]
+    - State "ONGOING"    from "TODO"       [2012-02-13 Mon 16:21]
+    - State "TODO"       from ""           <2012-02-10 Fri 16:01>
+
+    Now that it's implemented, let's see how much it helps.
+    Just shove a return false at the top setupRetry.
+
+    And I'm stumped... With perf record the opt-ed version is actually faster!
+    With perf stats it's slower but all the metrics are lower!
+
+    It might just be a cache ping pong problem with the root node.
+    Essentially we have so many threads spamming the root that it's being bounced
+    around the processors. Not entirely sure which metric in perf could give me
+    this information though.
+
+    Note that when recording with perf we notice that ALOT of time is spent in
+    GcLock::updateData which is mostly called by enterSharedCS and exitSharedCS.
+    This means that all the pin and unpinning we're doing is expensive.
+    Although we can't really explain our current prediciment using that dataset
+    because it's not consistent with the other results... poo.
+
+    Just forget this for now and come back to it later.
+    Might want to run it on a more reasonable test case as well.
+
+**** Random Keys
+     random()
+***** Fixed concurrency bottleneck
+      multithreaded(8): 3823 inserts in 1s at 3.82300kinserts/sec
+      setRootSuccesses = 49127
+      setRootFailures = 234193
+      overheadRatio = 82.6602%
+      setRootFastRetries = 11328
+      setRootSlowRetries = 222865
+      ratio = 4.83704%
+***** Base line
+      multithreaded(8): 4391 inserts in 1s at 4.39100kinserts/sec
+      setRootSuccesses = 55523
+      setRootFailures = 280046
+      overheadRatio = 83.4541%
+      setRootFastRetries = 0
+      setRootSlowRetries = 0
+      ratio = -nan%
+**** Seq Keys
+     int key = i * nthreads + threadNum;
+***** Fixed concurrency bottleneck
+      multithreaded(8): 6207 operations in 1s at 6.20700kops/sec
+      setRootSuccesses = 78478
+      setRootFailures = 372595
+      overheadRatio = 82.6019%
+      setRootFastRetries = 177805
+      setRootSlowRetries = 194790
+      ratio = 47.7207%
+***** Base line
+      multithreaded(8): 7139 operations in 1s at 7.13900kops/sec
+      setRootSuccesses = 89303
+      setRootFailures = 230044
+      overheadRatio = 72.0357%
+      setRootFastRetries = 0
+      setRootSlowRetries = 0
+      ratio = -nan%
+**** With Perf - Seq Keys
+     perf record -g -o perf-optg.data build/x86_64/tests/mmap_trie_concurrency_test
+     Note that I ran a seq keys test right after this test with similar results as above...
+***** Fixed concurrency bottleneck
+      multithreaded(8): 7377 operations in 1s at 7.37700kops/sec
+      setRootSuccesses = 91851
+      setRootFailures = 452946
+      overheadRatio = 83.1403%
+      setRootFastRetries = 197449
+      setRootSlowRetries = 255497
+      ratio = 43.5922%
+***** Base line
+      multithreaded(8): 6061 operations in 1s at 6.06100kops/sec
+      setRootSuccesses = 77335
+      setRootFailures = 248134
+      overheadRatio = 76.2389%
+      setRootFastRetries = 0
+      setRootSlowRetries = 0
+      ratio = -nan%
+**** Perf Stats - Seq Keys
+     | Stats name            |    Baseline |   Optimized |       Delta |   err % |
+     |-----------------------+-------------+-------------+-------------+---------|
+     | L1-dcache-loads       | 18866826729 | 16869679054 | -1997147675 |  -11.84 |
+     | L1-dcache-load-misses |   333005999 |   326130644 |    -6875355 |   -2.11 |
+     | L1-dcache-stores      | 12665829421 | 11482519158 | -1183310263 |  -10.31 |
+     | L1-dcache-stores      | 12648877431 | 11548985431 | -1099892000 |   -9.52 |
+     | L1-dcache-prefetches  |    97113005 |    94673731 |    -2439274 |   -2.58 |
+     | L1-dcache-prefetches  |    90528626 |    88136368 |    -2392258 |   -2.71 |
+     | LLC-loads             |   466611777 |   515765854 |    49154077 |    9.53 |
+     | LLC-load-misses       |   402711043 |   454473481 |    51762438 |   11.39 |
+     | LLC-store-misses      |   120594807 |    96836214 |   -23758593 |  -24.53 |
+     | LLC-prefetch-misses   |   247017749 |   238665910 |    -8351839 |   -3.50 |
+     | dTLB-load-misses      |     8962260 |     7311250 |    -1651010 |  -22.58 |
+     | dTLB-store-misses     |      259976 |       53782 |     -206194 | -383.39 |
+     | iTLB-load-misses      |     1099901 |      667885 |     -432016 |  -64.68 |
+     | branches              | 11536513221 |  9788891453 | -1747621768 |  -17.85 |
+     | LLC-loads             |   461678069 |   519865890 |    58187821 |   11.19 |
+     | LLC-stores            |   130405716 |   100801618 |   -29604098 |  -29.37 |
+     | LLC-prefetches        |   616594220 |   609862393 |    -6731827 |   -1.10 |
+     | dTLB-loads            | 18907201207 | 16867435071 | -2039766136 |  -12.09 |
+     | dTLB-stores           | 12632128260 | 11371665835 | -1260462425 |  -11.08 |
+     | iTLB-loads            | 65172671557 | 57882013441 | -7290658116 |  -12.60 |
+     | cache-references      |   620823498 |   608319850 |   -12503648 |   -2.06 |
+     | cache-misses          |   248399570 |   237760282 |   -10639288 |   -4.47 |
+     | branch-misses         |   164717690 |   142722758 |   -21994932 |  -15.41 |
+     #+TBLFM:$4=$3-$2;::$5=($4/$3)*100;%.2f
+***** Opt
+      multithreaded(8): 5890 operations in 1s at 5.89000kops/sec
+      setRootSuccesses = 74241
+      setRootFailures = 358219
+      overheadRatio = 82.8329%
+      setRootFastRetries = 168983
+      setRootSlowRetries = 189236
+      ratio = 47.1731%
+      10.045144732  seconds time elapsed
+***** Baseline
+      multithreaded(8): 6528 operations in 1s at 6.52800kops/sec
+      setRootSuccesses = 83417
+      setRootFailures = 255689
+      overheadRatio = 75.4009%
+      setRootFastRetries = 0
+      setRootSlowRetries = 0
+      ratio = -nan%
+      10.267659008  seconds time elapsed
+*** DONE SEGFP / SEGV when inserting a bunch of 0 values.		:bug:
+    - State "DONE"       from "ONGOING"    [2012-03-08 Thu 08:53]
+    - State "ONGOING"    from "TODO"       [2012-03-08 Thu 08:53]
+    - State "TODO"       from ""           <2012-02-13 Mon 17:33>
+    - FROM: [[file:~/code/platform/mmap/mmap_trie_sparse_nodes.h::struct%20CompressedNodeOps][file:~/code/platform/mmap/mmap_trie_sparse_nodes.h::struct CompressedNodeOps]]
+
+    The issue is with compressed node so to reproduce, add a bunch of sequential keys with the
+    value 0. Sit back and watch it burn.
+
+    Since this is in CompressedNode, this means that it's on one of the 64bit key tests.
+
+    => When adding values of 0 associated with sequential keys, the compressed can
+    encode the key value pair with 0 bits. Yup, it can essentially contain an infinit
+    number of kv pairs! Unfortunately, it's limitted by the size var that is an uint8_t
+
+    The bug was related to a division that didn't handle this proplerly which is now
+    fixed.
+
+*** DONE Arbitrary key size					       :task:
+    - State "DONE"       from "ONGOING"    [2012-03-07 Wed 11:54]
+    - State "ONGOING"    from "TODO"       [2012-02-24 Fri 13:17]
+    - State "TODO"       from ""           <2012-02-24 Fri 12:33>
+
+    Make a todo entry to fill in this todo entry... or something...
+
+    We want to insert like a 1gb key in the trie. Yeah nothing wrong with that at all.
+
+    - Modify KeyFragment
+    - Make a UnaryNode to help out with the next point.
+    - Modify makeMultiLeaf so that it doesn't pass keys with more then 64 bit to sparse node.
+      and whatever other nodes won't play nice.
+    - Modify the interface to the trie for unlimitted key length.
+
+    Notes:
+    - SparseNode.copyAndPrefix -> Broken! must call makeMultiLeaf()
+
+    Unary node = BWAD IDEA!
+      The reason is that we wanted to use it to shove in front of a sparse node in order to
+      siphon all the bits of the keys that we couldn't store into the node.
+      This won't work because the bits of the keys we want to siphon off could all be different
+      this means that we'd have to store one key fragment repr per value under us which sucks.
+
+    VariableKeyedTerminalLeaf or whatever...
+      The idea is to like a sparse node but with key fragments so:
+      - 1 value = 12 (KF) + 8 (value) = 20 bytes.
+      - 3 value = 60 bytes + 4 bytes for size = 64!
+
+    We should still prefer sparse nodes and compressed node when working with keys < 64.
+    Otherwise just default to VKTLorWhatever nodes and add fancier crap later.
+
+    Note that even if sparse nodes does have the 64 bits to contain an offset, without the size
+    we're kinda screwed. We could add it at the begining of the string or modify the string alloc
+    to return the size and use the sparse size to give us the leftovers.
+
+    This could kinda suck if we're dealing with strings whose size vary alot because the key to
+      sparse nodes all have to be the same size, which sucks.
+    Would work wonderfully with things like guids or unique identifier whose size tend to be
+      all the same.
+
+    => Still freakishly slow but it's good enough for now.
+
+**** DONE Zero length key not absorbed in binary node.			:bug:
+     - State "DONE"       from "ONGOING"    [2012-03-02 Fri 16:48]
+     - State "ONGOING"    from "TODO"       [2012-03-02 Fri 16:48]
+     - State "TODO"       from ""           [2012-03-02 Fri 15:53]
+
+     Binary node doesn't properly absorb zero length key in allocMultiLeaf.
+     see small string ex:  0drj, 27 -> kretp, 28
+
+     => The thing is that they're not really 0:0. They actually have 1 bit that's
+     in the binary node above it. And because of that, it can't be merged up.
+
+**** DONE Too slow, need to optimize.				       :task:
+     - State "DONE"       from "ONGOING"    [2012-03-07 Wed 11:50]
+     - State "ONGOING"    from "TODO"       [2012-03-07 Wed 10:02]
+     - State "TODO"       from ""           <2012-03-07 Wed 09:43>
+
+     The concurrency test works at a glacial pace and rcu times are quite high.
+
+     The most likely explanation for this is that we have a trie (free list) within a trie.
+     What this means is that if the free list isn't super fast it's going to cause all sorts
+     of problems with failed root sets on the super-trie and that will create a truck load of
+     temporary nodes and strings which all have to be deallocated during gc.
+
+     So long story short... string alloc needs to be FASTER!
+
+     Could also optimize key fragment by using memcpy when saving the key. One problem though
+     is that the last byte will be fubared. So we could use memcpy for bytes and pad the rest
+     with the bit range stuff.
+
+     => By switching to a first fit approach it made the concurrency test fast-enough-ish.
+     It's still damn slow but it'll do for now.
+     Personally, I think we should use a TLSed free list and split the free blocks into
+     size buckets. Also add a trie to index the blocks by their offset for deallocation.
+     This has the benifit of removing any and all concurrency issues, servicing allocation
+     very quickly most of the times while keeping deallocs fairly fast.
+
+     On the other hand, if a thread dies, we have to somehow reclaim it's free list.
+     There are several ways to do it but it gets somewhat complicated and tricky.
+
+     Actually this might suck because if a node is allocated by one thread and deallocated
+     by another well... there's simply no way to coalesce these blocks during deallocation.
+
+*** DONE Concurrency tests are failing on ag2			   :task:bug:
+    - State "DONE"       from "ONGOING"    [2012-03-12 Mon 09:48]
+    - State "ONGOING"    from "TODO"       [2012-03-12 Mon 09:48]
+    - State "TODO"       from ""           <2012-02-28 Tue 14:35>
+
+    Note that nothing is broken on dev or ag1(?) so that means it's the env that's foobar.
+    ag2 is running gcc-4.6 which means that a thousand things can be wrong.
+
+    => Was caused by a left shift of 64 which is undefined behaviour in C++.
+    That was in bit_range_ops stuff. This should also fixe the weird issues I was having
+    with KeyFragment::copyBits.
+
+*** DONE Build an interface layer on top of the trie                 :task:
+- State "DONE"       from "ONGOING"    [2012-04-20 Fri 16:58]
+- State "ONGOING"    from "TODO"       [2012-04-18 Wed 11:20]
+- State "TODO"       from ""           <2012-03-02 Fri 09:35>
+
+This layer will be more like a strongly typed version of the actualy trie.
+
+That layer will be comprised of (int = uint64_t):
+- pair<int, int>
+- pair<int, string>
+- pair<string, int>
+- pair<string, string>
+- vector<T>
+- set<T>
+
+Eventually the idea is that we might have stuff like this:
+- pair<int, set<T> >
+
+
+The rationale behind this is that we don't want to give the user enough rope to hang themselves.
+So we provide a strongly typed interface that won't blow up in their face un-expectedly (eg
+mixing uint32_t and uint64_t keys and wondering why the order is fubared).
+
+=> Both the js and the c++ templated interface for map are up and running.
+vector and set still left to do.
+
+**** DONE Delete the values when deleting from the trie.		:bug:
+     - State "DONE"       from "ONGOING"    [2012-04-18 Wed 11:19]
+     - State "ONGOING"    from "TODO"       [2012-04-18 Wed 11:19]
+     - State "TODO"       from ""           [2012-04-18 Wed 10:19]
+
+     Tricky when it comes to clear.
+
+     => TrieUtils now handles the deletes by deferring them. There's also an
+     optimization tweak that avoids deletes when the values don't need to be
+     deleted.
+
+**** DONE Make it so a TrieT can own a version for it's lifetime    :task:
+- State "DONE"       from "ONGOING"    [2012-04-20 Fri 16:39]
+- State "ONGOING"    from "TODO"       [2012-04-20 Fri 16:39]
+- State "TODO"       from ""           [2012-04-18 Wed 12:07]
+
+Right now TrieT grabs a new version on each call. It would nice if you could
+string multiple calls with the same version. Would probably require
+splitting mutating from non-mutating ops.
+
+The get() functions kinda lends themselves well to this. If we could make
+them hook into some kind of policy or maybe overload them in subclasses
+with different policies, then it would all magically just work. Would
+probably need something to update the version after a mutating op.
+
+How to handle mutating ops is a bit tricky and will require some SERIOUS
+deep though in the nature of philosophy and the world or something. The
+answer is probably going to be 42.
+
+=> Done using the Policy template parameter.
+
+*** TODO Compressed Large Key Node				       :task:
+    - State "TODO"       from ""           <2012-03-05 Mon 09:59>
+
+    What we need to do is use the bit writer and the bit extractor to compress the 3 fields
+    of each entry in Large Key Node: key.bits, key.key, value.
+
+    To do that we'll compress each value by stripping it's leading zeros. In order to recover
+    the information we'll break up each entry into X bits block which we will precede with a 1
+    bit header. The one bit header will indicate whether there is another block for that value
+    or not.
+
+    We can further optimize it by noticing that for inline keys, we don't need to store the key
+    as a blocks because we already know it's size from having read the keyLen field.
+
+    Note that this scheme has a disadvantage. We constructing the node, we won't know whether
+    the number of leafs given to us will actually fit into the object until we try to build it.
+    We could use some heuristics (eg. theorical limit, quick calc and whatnot).
+
+*** TODO Add hash to large keys					       :task:
+    - State "TODO"       from ""           <2012-03-13 Tue 09:46>
+
+    The idea is that when we have keys that are larger then 64 bits, we may have to read
+    an undisclosed amount of memory in order to do the comparaison in the trie. Now when
+    we're searching this can kinda suck and slow shit down.
+
+    The idea is to add a small 8 bit hash to every key fragment (chances are that we can
+    sutff it in the bits var) and use that as a quick comparaison. Could help speed up
+    searches and it can always be calculated when transforming the TrieKey into a KeyFrag.
+
+    Could use the CityHash library for it or just do a simple XOR. It doesn't really need
+    to be super accurate because we're not using it to build a hash table or anything.
+    Just make it fast.
+
+*** TODO Add Vector and Set interface                                  :task:
+- State "TODO"       from ""           <2012-04-20 Fri 16:59>
+
+Model an std::set and std::vector using our trie in the same manner we
+made the map.
+
+*** TODO Reduce the include overhead for mmap_map.h                  :task:
+- State "TODO"       from ""           <2012-04-23 Mon 10:34>
+
+Right now, mmap_map.h is full of templates. This means that all the
+implementation headers end up leaking into the client application. It would
+be nice if we could find a way to reduce the number of includes either in
+mmap_map.h or in mmap_trie.h
+
+*** TODO Support for 64bit integers in JS                            :task:
+- State "TODO"       from ""           <2012-04-23 Mon 11:42>
+
+javascript only supports full precision 32 bits integers or double for 64
+bits integers. This obviously won't work so what we need to do is create
+some wrapper class or something to properly communicate 64 bit values.
+
+Note that this becomes a problem when both JS and C++ interfaces are using
+the same mmap trie.interopt between the two will go haywire when values
+exceeds 32 bit.
+
+*** TODO Add typing checks to the trie                               :task:
+- State "TODO"       from ""           <2012-04-23 Mon 13:09>
+
+Right now you can add a bunch of ints in a trie, clear it, then add a bunch
+of strings and everything will work. Heck you can even have strings and ints
+coexist in the trie if you skip the high level interface or if you
+instanciate 2 types of map on the same trie.
+
+So anyways, would be nice if we added type information to the trie entry in
+the trie allocator to check for this kind of boondogle.
+
+*** TODO Checkout the redis interface                                :task:
+  - State "TODO"       from ""           <2012-04-30 Mon 16:18>
+
+Try to emulate the redis interface for the javascript interface. It's
+supposed to be well though out and useful interface.
+
+*** DONE Region pin and resizes                                      :task:
+- State "DONE"       from "ONGOING"    [2012-05-14 Mon 15:46]
+- State "ONGOING"    from "TODO"       [2012-05-14 Mon 15:46]
+- State "TODO"       from ""           <2012-05-03 Thu 09:42>
+
+The current approach of continuously pinning and unpinning is pretty damn slow
+since we're wasting a massive amount of time incrementing and decrementing
+counters.
+
+So one alternative that was proposed is to use exceptions to restart an op
+if we detect a race with a resize. The idea is that resizes that may move the
+mmap are rare enough that the mechanism shouldn't be invoked too often. Exact
+details for this mechanism still needs to be hashed out (mostly how do we
+detect the race? segfault handler?)
+
+=> Didn't realized there was an existing entry for this. So solution is
+detailed down below.
+
+*** TODO LargeKeyNode no longer effecient with ref counted KFs       :task:
+  - State "TODO"       from ""           <2012-05-09 Wed 11:42>
+
+Now that we ref count our KF, the whole read all the KVs then dispatch to
+makeMultiLeafNode(...) is no longer efficient. Calling KF::copyRepr would
+be much faster.
+*** DONE Use exceptions for the resizing logic                       :task:
+- State "DONE"       from "ONGOING"    [2012-05-14 Mon 15:45]
+- State "ONGOING"    from "TODO"       [2012-05-09 Wed 11:44]
+- State "TODO"       from ""           <2012-05-09 Wed 11:44>
+
+Currently the whole trie pins and unpins the memory region like there's no
+tomorrow. This sucks big time when it comes performance because we keep
+entering and exiting RCU CS.
+
+The improvement would instead pin the region at the begining of a whole
+operation only. If we need to move the region during a resize, we instead
+throw an exception that undoes the operation, unpin the region, get an
+exclusive lock, do the resize, pin the region and restart the operation.
+
+Currently the handling of the pinning is done by the MMAP_PIN_REGION and
+MMAP_UNPIN_REGION macros (few shorthands also available).
+
+Note that VERY special care should be taken in the trie when calling
+allocCopy on nodes that have KeyFragments. The reason is that they could
+have external storage that if not properly handled could lead to a massive
+headache. See binary node's copyNode(...) function for more details.
+
+Will also need to cleanup most of the pinning stuff in memory region
+because most of it will no longer be needed. This also means removing all
+the calls to unpin...
+
+=> All done and much faster.
+
+*** TODO Remove all the GcLock::ThreadGcInfo params from the trie    :task:
+- State "TODO"       from ""           <2012-05-10 Thu 15:06>
+
+There's aaaaaaaaaaaaaaaaaaalot of them (413)... And they're all useless now.
+
+They're useless because they used to be passed to the pinning function as
+an optimization (aparently keeping that pointer is faster then accessing the
+TLS). But now that the pinning is only done at the entrance of an operation,
+those pin call never happen. At best I think it may be used in the isPinned()
+call but that's it. Making passing that stuff everywhere a giant waste of time.
+
+Note that this is a fairly tedious thing so do it when I'm half asleep or
+on a week where I need to boost my impact graph.
+
+*** TODO Batched write                                                 :task:
+- State "TODO"       from ""           [2012-05-14 Mon 15:32]
+
+The problem is that multithreaded-writes suck right now because of the
+bottleneck at the root. Since we want to reach a target of 100k writes per
+second we have to change our approach.
+
+The new approach is to batch up writes in a seperate trie version and then merge
+then back into the main trie. Each batched version would only be accessible by a
+single thread and each thread would have it's own batched trie. This means that
+it would scale WAY better to multiple thread and since we can easily to 30k
+writes per second, reaching 100k per sec shouldn be possible.
+
+Of course, this is way easier said then done.
+
+Should we handle multiple concurrent merges back into the main trie?  That's a
+tricky answer. If try to fit it in our existing mechanics then it would work
+concurrently but it'd be a mess to restart at the root.
+
+Should it be journaled and snapshotted? Probably not. So that means that it
+would be possible to construct the batched version outside the mmap and then use
+specialized magic to write them in.
+
+What if one thread deletes a node that was changed by another thread?  Could
+restrict the ops to insert and remove. That would simplify the number of
+situations that can occur in the merge algo and they could be dealt with using
+timestamps.
+
+**** Solution 1 (Holy grail of awesomness aka full graph support).
+
+1) you call the branch function with a trie Id. This would copy the current root
+in a new trie root. Would probably keep track of which root you branched from
+along with keeping an RCU lock on that original root.
+
+2) You can then screw around with that root at your hearts content.
+
+3) call the merge function with the original id. At which point a 3-way diff
+occurs. Now this will not require a full sweep because you can tell where you
+made modifications (node has changed).
+
+4) Copy the new root to your branch.
+
+This can get ugly fast though especially when you condider that you can have
+multiple modifications that could have been made to the trie while you were not
+looking.
+
+I guess merging would require finding modified nodes by crawling both the
+original and the branch tree. We also keep track of our position in the new tree
+so we can do the modifications. Positions would be kept as a path that would act
+as a stack for in-order travesal.
+
+To determine when it's a good time to merge back, you keep an op count on the
+branch. If the op count reaches a min treshold then you try to acquire an
+exclusive lock on the original trie. If it fails then you keep working and
+retrying on every other op or something. When you reach a maximum treshold, you
+block on the exclusive lock. Should allow some concurrency.
+
+Note that this hinges on the fact that we can merging 2 threes is faster then
+adding the diffs one by one. I'm not convinced but it's worth a try if I can
+figure out a merging algo that's not stupidly slow.
+
+Advantage of a full trie branch is that you can use it like any old regular
+trie.  Unfortuantely you also disable GC passes for anything created after your
+branch (this should stabilize though since there will be regular merging of the
+branches).
+
+**** Solution 2 (journalling for multithreading).
+
+1) On branch you create a new journal. Could be a trie but one that starts off
+empty.
+
+2) On an op you add to the given key a special struct that represents the op
+being executed.
+
+3) On merge you read off the ops one by one and play them on the tree. Note that
+this is a 2-way merge which should be faster then a 3-way merge (no diffing
+required).
+
+The disadvantage here is that changes won't be visible until they are merged
+back into the original trie.
+
+**** Solution 3 (CoW with fast in memory local changes).
+
+The idea is to optimize for writes in a single threaded environment and merge
+back to the multithreaded environment. Writes don't have to be visible right
+away which gives us some room to work with.
+
+1) On branch create copy the trie root. Note that this isn't restricted to our
+mmap heap. It could be left to the tcmalloc heap.
+
+2) When modifying a node for the first time, copy it into our local heap. Also
+mark it as being copied. The mark should probably go in the TriePtr because of
+inline node where there's nowhere else to put the mark.
+
+3) When modifying a marked node, do the modification in place. No need for CAS
+or sync because the branch is single threaded. Because we're in place this
+should be blazingly fast.
+
+4) On merge, just write back any marked nodes back into the trie. Note that
+we're assuming no other threads modifyed the trie in the meantime (could change
+that later if we decide to scale this scheme). This is also the fastest merge
+mechanism because we know each nodes that were modified so it's a 2 way diffing
+on nodes instead of keys (while that's true, we're still going to require a
+hefty amount of key manipulation to get anywhere).
+
+
+Note that this is also the solution that requires the most amount of significant
+modifications. While allocating in a new heap is rather easy, inplace
+modifications requires a whole new set of virtual mutating functions. with their
+own specialized algorithm. I predict lots of super happy funtime in my
+future. Too much in fact. I think the new algos should be considerably simpler
+then their non-inplace counterpart but they are going to have their own corner
+cases and unpleasant thorny annoyances (like where am I going to shove the KF?).
+
+If we make the local copy thread safe (merge would be especially useful to have
+thread safe). What we then have are transactions where modifications are super
+fast. If the merge is thread safe also then it doesn't matter how fast it is
+because we can just do it in parallel with any incomming writes. Although this
+might be to complicated to make it work. It's worth a try though.
+
+
+The reason why this whole scheme has a reason to work are:
+1) We can do most of the KF allocations with tcmalloc until the final
+   merge. That alone should invalidate a lot of the performance issues with
+   string keys. With some additional optimizations, they will probably be as
+   fast as int keys.
+2) With int keys, another bottleneck with a single threads are gc passes at the
+   end of every operations. In our scheme, gc passes will never occur in the
+   main input thread. Speeding up things considerably (slowing down merges
+   though).
+3) No pointless node copies and no races on the trie root can't hurt either when
+   we'll try to scale this.
+
+All those things should allow to reduce the latency to under 10us. Now all we
+need is for the merge algo to keep up. Worst part is that profiling this will
+become a lot harder if we can't have per thread stats.
+
+---
+
+GcLock problem. In order to make this work with multiple processes, we need to
+switch from a shared lock to an exclusive lock. Now if we do this the naive way
+then the gc will run and we're fucked. If we hold on to the shared lock then we
+deadlock. So what we need to do is add an upgradeToExclusive function. This
+should transition from a shared lock to an exclusive lock without letting go of
+the current epoch. Once the exclusive lock is released the gc pass can run on
+the spot or be executed manually. Doesn't really matter.
+
+***** Heap Management
+
+We essentially have 3 heap choices here:
+- use the file backed region as everything else: Merge doesn't have to do any
+  copies which is nice but we can't use the current GcList (not too much of an
+  issue). Also we're not as crash resistant (we never were anyways).
+- use a seperate private region per forks. This has many advantages, especially
+  if we're talking about locality and cleanup cost (almost none). We do have to
+  change the TriePtr which is bound to be a giant pain.
+- use the tcmalloc heap. Problem with this solution is that we don't know the
+  size of the pointers and the trie assumes something less then 48 (should
+  confirm this).
+
+We could modify MemoryAllocator so that it can returned a Thread Local memory
+region. This region would then be used to make all our local copies of the trie
+nodes. This could improve locality of the data in both the local and shared
+regions. It's a bit like a mark and sweep gc (probably the wrong name).
+
+To determine in which region the node is, we could add a mark to the TriePtr:
+- SHARED: The node is located in the main heap.
+- PRIVATE: The node is located in a local heap.
+
+For KF, add a bit in it's repr and have data cast into a straight up ptr. If
+possible make it a pointer to a compact_vector and have KF use that as it's
+vector. Would avoid making some of the copies. Note that this change is
+self-contained so it can wait till we have the rest working.
+
+TCMALLOC: While the allocs would be fast, we'd still need to clean them up
+(unlike the other 2 solutions). There's also an issue with pointers that it
+returns. Essentially TriePtrs have a sort of assumed maximum size of 48
+bits. While the majority of allocations from linux always seem to fit within
+that range, it's not an assumption I'm willing that take. We could get around
+that by building a whole new Trie structure fit for TCMalloc but that would
+hinder reads and require a truck load more work. Don't really want to start from
+scratch so TCMalloc is OUT.
+
+File backed heap: Faster merge because we don't have to copy anything (just need
+to remove the marks). Requires a new GcList thing to properly cleanup the
+nodes. If we decide to scale this scheme then there will be a concurrency
+pressure on the allocators.
+
+Thread-Local heaps: Fast cleanup (just unmap the whole region). Better locality
+(only the things relevant to the tread will be in the thread-local heap. Slower
+merge because we have to copy over but this may improve locality quite a bit. No
+concurrency on the allocators.
+
+Since it's damn hard to tell which of the two proposition is better, I sugest we
+do both. By that I mean start with a single solution (it's simpler), take some
+perf metrics, then move on to the thread local heaps and compare the perf
+metrics. This is probably best because the high-risk stuff is in the merge algo
+anyway which is what I really want to time.
+
+***** Merge Algo
+
+If possible, we really want this to be thread safe. Worst case, use locks on
+subtrees. The reason for this is because if we can do merge in parallel with
+writes then it doesn't matter how fast it is. Actually, it doesn't have to
+be. See the next paragraph for more details.
+
+Safest way to guarantee high through put for 1 write thread, is to fork right
+before we start the merge process. This has the odd behaviour that the writes
+that were just committed just disapear. Could be slightly (aka very) confusing
+from a high level point of view. So the way to recouncile this in the interface
+is to have the thread that does the commit block until the merge is
+finished. Before the merge takes place, we spin up a new thread to keep doing
+whatever. Unfortunately that could be hard to use. Probably write both interface
+and just shove a gigantic warning sign in front of the single write thread
+version.
+
+Pictoraly speaking, it looks like this (where ! is the merge and |\ is a new
+branch):
+
+
+                                       |
+                                       |
+                                       |\
+                                       | |
+                                       | |
+                                       |/
+                                       !\
+                                       ! |
+                                       | |
+                                       |/
+                                       !\
+                                      ...
+
+Note that depending on how fast the merge is, we may be able to support multiple
+write threads and interleave their merge op.
+
+So for the actual merge algorithm...
+
+If I use the same node repr and we're in the same heap then when merging new
+nodes we can simply redirect the pointer to the inplace nodes and remove the
+mark.
+
+Note that we can't use delete markers. Take the example where a terminal keyed
+node bursts into a sparse node. We can't keep the pointer to the original.
+Actually, why do we even need delete markers? I think we should be able to tell
+just by looking at the nodes.
+
+For the rest, it's a three-way merge so look at the details of the merge algo in
+the section dedicated to the solution 1.
+
+***** Interface
+
+So high level, I was considering a function called transaction() which
+would take a lambda and a trie id. This function would:
+
+1) Launch a new thread that starts at step 2). Whether we join or return is up
+   to the user.
+2) grab the shared lock on the source trie
+3) grab a trie root and copy it into a new trie root. Setup any CoW elated
+   mechanism.
+4) call the lambda (possibly in a thread).
+5) If the lambda return indicates it, spin up a new thread that starts from 2).
+6) upgrade to an exclusive lock
+7) do the merge.
+8) unlock and return the thread to the pool. Oh and we need a thread pool :)
+
+*** TODO Get all keys for a stem                                     :task:
+- State "TODO"       from ""           <2012-05-17 Thu 11:58>
+
+So the bidder team would like an op that returns all the KV for a given key
+stem. I thinkt that I can implement that with the upper_bound and lower_bound
+functions that I was planning to do with the string allocator.
+
+upper_bound would work but the stl semantic for lower_bound are probably not
+compatible. But on a trie lower_bound that does what I said probably makes more
+sense.
+
+*** TODO N Writer process -> Assumption that deallocate won't throw is wrong :bug:
+- State "TODO"       from ""           [2012-05-29 Tue 13:57]
+
+When we have multiple write processes, we could attempt to deallocate a node
+that is outside our mapped region. This will end up throwing and cause all sorts
+of problems.
+** InPlace Trie Tasks
+*** TODO Memory Leak when inserting into inplace binary node          :bug:
+- State "TODO"       from ""           <2012-05-30 Wed 09:12>
+- FROM: [[file:~/code/platform/mmap/mmap_trie_binary_nodes.h:://%20\todo%20Note,%20this%20whole%20branch%20is%20a%20leaky%20boat%20if%20we%20need%20to][file:~/code/platform/mmap/mmap_trie_binary_nodes.h::// \todo Note, this
+  whole branch is a leaky boat if we need to]]
+
+#+BEGIN_SRC c++
+    KeyFragmentRepr nodePrefixRepr = nodePrefix.allocRepr(area, node.info);
+    KeyFragmentRepr node2PrefixRepr = node2Prefix.allocRepr(area, node.info);
+    TriePath inserted = makeLeaf(area, node.info, suffix2, value, newState, gc);
+    Node node2 = allocEmpty(area, node.info, newState);
+#+END_SRC
+
+If any of these calls throw because of a resize exception then the calls above
+it will leak memory if we're operating on a inplace trie . We can fix it using
+some ugly try catch but a better mechanism for inplace nodes would be
+preferable.
+
+Actually this might be salvageable for the make leaf call. The idea is that
+inserted will be in the newNode list so that when we merge, if we remove
+newNodes as we merge then we can eventually find the ones that were "leaked" and
+clean them up approprietly. Kind of a hack though and we should probably strive
+for a nicer solution.
+
+*** DONE Merge - Enforce quick paths rules in diffing algo           :task:
+- State "DONE"       from "ONGOING"    [2012-06-07 Thu 16:33]
+- State "ONGOING"    from "TODO"       [2012-06-07 Thu 16:33]
+- State "TODO"       from ""           [2012-06-04 Mon 12:56]
+
+When recursing, we need to check for:
+
+- if src.state == IN_PLACE (equivalent to src == base)
+  - return immediately (don't go down that branch)
+- else if dest != base
+  - Replace pointer from dest to src and return (also known as quickMerge)
+
+These are quick and easy win in the algo and also a limitter to how far we
+recurse.
+
+=> Everything passes through either diff or diffValueValue so I hooked those two
+functions and we're all good.
+
+*** DONE Merge - Need more fine grained conflict management          :task:
+- State "DONE"       from "ONGOING"    [2012-06-14 Thu 09:40]
+- State "ONGOING"    from "TODO"       [2012-06-14 Thu 09:40]
+- State "TODO"       from ""           [2012-06-04 Mon 16:17]
+
+Having a single function won't really cut it. I think the idea is that I will
+eventually wrap the whole thing in a class. I'll then be able to have multiple
+callbacks for multiple situations.
+
+One of the issues right now is that conflicts for removing a value that was
+modified is problematic. Since we only have one return value, the user can tell
+us to change it to a certain value or to just remove it altogether.
+
+=> There's now 2 conflict functions passed to the merge. One for inserts and one
+for removes. Note that the remove could use a return value to insert but I'll
+leave that for later.
+
+*** DONE Merge - Diff's use of advanceDest is wrong                  :task:
+- State "DONE"       from "ONGOING"    [2012-06-14 Thu 09:40]
+- State "ONGOING"    from "TODO"       [2012-06-14 Thu 09:40]
+- State "TODO"       from ""           [2012-06-06 Wed 13:51]
+
+The problem is that we usually call advanceDest but with the old prefix because
+we advance the other prefixes in the same fct call as the advanceDest
+call. Unfortunately we just don't pass those updated prefixes so the cursor ends
+up being waaaay behind.
+
+=> Complete algo change. This is irrelevant.
+
+*** DONE Merge - Most direct calls to XxxValue or ValueXxx are wrong :task:
+- State "DONE"       from "ONGOING"    [2012-06-08 Fri 14:13]
+- State "ONGOING"    from "DONE"       [2012-06-07 Thu 16:18]
+- State "DONE"       from "ONGOING"    [2012-06-07 Thu 16:16]
+
+Those functions expect the prefixes to be equal when they do their thing but it
+looks like we'll have to be able to make those calls without that restriction
+because when we're punting work from DrillBranch, we can't have that
+restriction.
+
+Heck when we're recursing from the Value function, that restriction goes out the
+window anyway so that restriction was bogus to begin with.
+
+=> findBranchingPrefix now takes care of adjusting the prefix to match.
+
+But there's still an issue with every ValueXxx or XxxValue functions where they
+use the key from one trie on the other trie. This is particularly prevalent
+within mergeInsert where we insert from one to the other. We need to adjust
+these before we move them over. Which sucks... Alot... Because that means we're
+copying to have to make copies of all these keys before inserting them.
+
+=> The remaining issue has been delt with the use of the adjustTerminalKey
+calls. The last remaining problem is with the diffValueValue which has a unique
+problem of its own and is documented in the code.
+
+
+*** TODO Merge - GC Scheme                                           :task:
+- State "TODO"       from ""           [2012-06-14 Thu 09:42]
+
+- Transactional.gc
+  + newNode: All the new src inplace nodes
+  + oldNode: All the nodes we've replaced for src
+
+- Merge.gc
+  + newNode: All the new dest inplace nodes
+  + oldNode: All the nodes we've replaced for dest
+
+**** Cleaning Base
+Here what we want is to deallocate all the base nodes that we replaced.
+
+In the general case that's the old nodes of the merge gc.
+
+There's also the case where we swap a dest node for a src node at a cut-off
+point. So to clean that up we need to find the nodes in base that have been
+replaced by src. We can't really use the transactional gc because we can't tell
+which nodes belong to which subtree.
+
+So I think we should crawl both src and dest (using our fancy merge algo).
+Extra branches in base => oldNode (recursive)
+Cutoff base.node() == src.node() => return
+
+This is correct because the only time we do the swaps is because
+~base.node() == dest.node()~ and so we're in a 2-way merge. Meaning that dest
+couldn't have marked any nodes for deallocations.
+
+**** Cleaning Src
+What we want to deallocate are all the nodes of src that we no longer need.
+
+This is a bit tricky because this is not something we want deleted when the
+merge fails but only when the transaction is comitted. So the idea is to find
+those nodes and do their deallocation (no need to defer) after we're done with
+the merge and before we're about to unpin the region.
+
+To find these we can mark any src nodes that we jump over while recursing down
+the trie during diff-ing. We also need to recursively mark all the in place
+nodes after a cutoffpoint. For removing, we can just recursively mark all the
+nodes that are inplace.  For Inserting, recursively mark the nodes as jump over
+them while recursing.
+
+Doing the inverse might be better and easier. So what we want is all the
+new nodes that are in use within the dest trie. This is much easier to find
+because this only happens if we swap a dest node for a src node. In this case we
+can recursively mark any in place node within that subtree.
+
+To do the deallocation, we just do the difference between the the nodes we
+marked and the new nodes within the transactional gc. The difference will become
+the oldNOdes and the marked nodes will become the new nodes. We then just
+commit.
+
+Note that it's ok (if not exactly clean or elegant) to trash the oldNodes within
+the transactional gc because we can't commit those anyway. Those nodes don't
+represent the current reality of base and could therefor lead to double
+deallocations if we keep them there. For all intended purposes the old nodes in
+there are only useful in a 2-way merge scenario.
+
+**** Putting things together
+
+So the final transactional gc will be composed like so:
+
+- newNode (don't really need to build this):
+  + merge.gc.newNode
+  + marked src nodes
+
+- oldNode:
+  + merge.gc.oldNode
+  + marked base nodes (should be included within merge.gc.oldNode)
+  + difference(transactional.gc.newNode, marked src nodes)
+
+We then commit this before unlocking the shared lock.
+
+* Allocators
+** Alloc Notes
+*** PageTable							       :note:
+**** fullLevels -> Is for lower level nodes
+**** fullNodes -> Used by the MemoryAllocator
+*** Cache Line Size = 64 bytes		     			       :note:
+*** Page Size = 4096 bytes		     			       :note:
+    A linux constant or something so we can assume it's always true (I think).
+*** mmap related syscalls 					       :note:
+**** mmap(2)
+***** MAP_SHARED
+      - Writes instantly visible (not CoW)
+      - Writes to disk meh-ish
+      - can force writes to disk with msync and munmap(?).
+
+***** MAP_PRIVATE
+      - CoW mapping
+      - No writes to disk
+      - Writes to the file may or may not be visible to mapped region. (POSIX)
+
+***** MAP_ANONYMOUS
+      - Not file backed.
+      - zeroed
+      - Can mix with MAP_SHARED.
+
+***** MAP_DENYWRITE (ignored)
+      - attempts to write to the underlying file are blocked with a signal
+      - Could be a good starting point if we ever kernel hack it.
+      - Should be noted that this might actually block ANY write to the file
+	even those from outside the process. And since there's no easy way to unset
+	a flag mapping this is a bit of a problem.
+
+***** MAP_LOCKED
+      - see mlock
+
+**** mremap(2)
+
+**** mlock(2)
+     pins memory region to RAM. Not what we want.
+
+*** Safe writes	- 1 Writer solution 				       :note:
+    data layout of mmap file:
+
+    First off, all the process will map the file as shared.
+
+    On Write:
+    A - reserve a journal space. Make sure it's map shared.
+    A - fork -> B
+    A - wait(B)
+    A - clean up journal
+    A -
+    A - return
+
+    B - unmap the file.
+    B - map the file as MAP_PRIVATE but keep the journalling shared.
+    B - Do the modification and keep a journal.
+          => Must keep the journalling data fine grained and ordered.
+	     The idea is that we have to playback the journal in the correct order.
+    B.Error -> On error, kill the fork and walk away.
+    B - write the journal back to the file.
+    B - sync up the disk.
+    B - play back the journal in the same order it was recorded onto the actual file.
+    B - sync up the disk.
+    B - write the result somewhere.
+
+    The real advantage of forking is that we can write a full journal into the disk
+    before any of the modifications are written to the file. So in case of panic,
+    revert the journal.
+
+    Cool thing about forking on write is that when leaving an read side CS and we
+    need to do defer work, it'll be done in it's own fork. The reader can return
+    right away.
+
+*** Safe Writes - N Writer solution 				       :note:
+    The idea is that we want to mmap a file into memory but any writes made to the
+    region will not EVER be reflected to the file.
+
+    We can then keep a journal of all our writes and organize them into transactions
+    that we can persist in a safe manner back to the file.
+
+    The problem with this is that we're essentially offloading all the write backs to
+    the Kernel and then we're complaining when it's not doing what we want...
+
+*** Safe Writes - Alt N Writer Solution 			       :note:
+    Make the region MAP_SHARED + MAP_ANONYMOUS.
+    This means that it starts zeroed but can still be shared among processes. Now
+    everytime we dereference an offset that isn't loaded we can just go read it from the file.
+    We can then mark every page we write too has dirty and transaction them up for a write back to file.
+
+    What do we do in the case of a resize though?
+    - We could just mark everything as unloaded but that would force re-reads from the disk.
+    - We could keep the old map around and just load from that one but that means that we'd be chaining
+      maps and searching backwards in time. This could balance out though if we dump really old mapping
+      or based on last read stats or remaining number of blocks or something.
+    - We could also MAP_FIXED into the end of the address space where very little resides.
+
+    The important bit here is that we want to load pages from the disk in the fastest possible
+    manner imaginable which makes locality of the data super important.
+
+    It will also break stuff like allocated strings that can span multiple pages and are not
+    accessed through any range boundaries. So it'd be hard to tell how much you have to load
+    when you're reading the string. The size I added could come in handy.
+
+    The problem is that the memory will only be shared between a process and all it's children.
+    So this could be an issue architecture wise. shm_open may be the solution.
+
+    Using segfaults to do some of the heavy lifting for us:
+    - Load the entire region with PROT_NONE.
+    - Register a segv handler on the entire region.
+
+    - On read access of a PROT_NONE, a segv is triggered.
+    - Load the data from the disk (or schedule it) and change to PROT_READ + PROT_WRITE
+
+    - On write to the region, segv is triggered.
+      * Won't really work because we'll only know the start address but not the range.
+      * Could be used to block off the adress range until the associated transaction is done.
+
+    Journaling & writes:
+    - General principles:
+      - 2 types of values:
+	+ Atomic: generally a 64 or 128 bit value used in atomic ops. Could be anything else though.
+	          We assume that this will change often so we always record them in the journal.
+	          In any case, trying to copy these after the fact is a terrible idea.
+	+ Data: anything else that's big.
+	        We assume that these are allocated and deallocated seldomly. So we can delay their
+	        We can copy into the journal after the fact because only one thread is fucking around
+	        with it at any one time. So the copy is delayed until another thread fucks with it.
+      - Writes to non-atomic values are already mostly transactionned in the trie so it should be a fairly
+	painless transition (see GcList).
+      - How do we mesh this with the GC though?
+
+    - Do the write
+    - Create a new Journal Entry
+    - Read the write data into the journal Entry.
+      - If it's a write on an atomic object, pass the written copy first.
+      - Journal entry should also have their own timestamps.
+    - Record the thread, transaction id, range.
+      * Problematic when two writes from 2 transaction happen on the same slab of memory
+	Would need to add the data
+
+    - On Commit, playback the journal entry for a given transaction to the disk.
+      * Gotta make sure that it's played back in a consistent manner so that 2
+	writes to the same location don't blow up.
+      * Also might want to issue an fsync after each or N transactions are sent to the disk.
+      * Could dedicate a process/thread to do this exclusively and dump a truck load of fancy pants
+	algo to make it efficient.
+
+    - Avoid duplicating writes to the journal (doesn't apply to atomic values which are always copied).
+	     Doing this step fast and concurrent will be difficult.
+      - Before writting, check if range is in the journal and select the newest entry.
+	- If it is, copy current memory data into that entry
+	  * So copy only ever happens when we need them. Neato!
+	  * Making this lock-free is probably not possible.
+	- Else, add your own journal entry
+      - Do the write
+
+    => Aparently, a journalling call per write is too slow but I'm not entirely convinced.
+    With some good, pre-allocated, lightweight data structure, you can probably add another
+    4-5 word to write per Write ops (we're not talking about a single byte here).
+    There's tons of stuff in the trie that takes way longer then this to execute. Biggest problem
+    would be concurrency stuff which has lots of small writes. There's no real solution for this
+    sadly.
+
+*** Safe Writes - Snapshoting stuff				       :note:
+
+    So the idea of the snapshot code is to map everything MAP_PRIVATE and when a writer
+    is executing, we fork the process. Every pages that have been touched by the writer
+    will then be copied and remapped somewhere else. This means that once the writer is
+    finished, we can compare the page table of the original process and the writer
+    to figure out what pages needs to be written back to disk. We can then fix the mapping
+    to make both the original mapping and the forked mapping point to the same thing.
+
+    This has the issue that is present in all solutions using MAP_PRIVATE, it only allows
+    a single writer. The reason is that if we have two writers then any modifications they make
+    to the allocator won't be visible by the other writer which means that the same piece of memory
+    can be allocated twice.
+    Even worst, if the the two writers modify the same page but in unrelated locations,
+    which page do we write back? Only real way to be sure is to trash one of the 2 writer thread
+    wasting a shit-tons of time.
+
+    What would be nice is if we could reuse snapshot on an anonymous mapping. we could then
+    periodically fork the anonymous mapping and keep a snapshot at time x. When we want to write
+    back we make another snapshot and compare the 2.
+    -> This really depends on the idea that if we write to the anonymous mapping, it will trigger
+       a COW on the private mapping. Man page says it's unspecified.
+
+    In any case, the stuff we have to change to make the snapshotting work:
+    - GcLock: All active GcLocks needs to be persisted into a seperate piece of the mmap which
+      will be map_shared for everyone. The 3 current GcLocks are: Region, FreeListTrie and any
+      other tries
+    - GcLock.defer: Remove the checkDefers() call from updateData and make the exiting writer
+      call it instead. Otherwise we end up with readers doing writes which is bwad.
+    - Detect incoming writers: The only way I can think of is MutableTrieVersion. So any calls
+      in that class will have to fork the snapshot thing. This makes having a clean seperation
+      between storage and logic kinda hard to maintain (unless everything goes through callbacks...)
+    - Finally, take care of all the tedious forking, maintenance and whatnot.
+
+** Alloc Questions
+*** DONE allocateClearBit really does need its atomic_tas	   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-25 Wed 16:24]
+    - State "ONGOING"    from ""           <2012-01-17 Tue 15:00>
+    - FROM: [[file:~/code/platform/mmap/full_bitmap.h:://%20TODO:%20this%20doesn't%20need%20to%20be%20atomic...][file:~/code/platform/mmap/full_bitmap.h::// TODO: this doesn't need to be atomic...]]
+
+    Can't get rid of the atomic_tas because it's also used from [[mmap:node_page.h::102][here]].
+
+    Actually it doesn't need to be a tas but there's a bit of wtf-y going here.
+    After the atom_tas call it check if it was set but findClearBit was called
+    on a local value and there's no possible race going here. The comment
+    for wasSet mentions that there could be a race... on local variables...?
+
+*** DONE Was this done on purpose?				   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-17 Tue 16:20]
+    - State "ONGOING"    from ""           <2012-01-17 Tue 15:28>
+    - FROM: [[file:~/code/platform/mmap/full_bitmap.h::0xffffffffffffffffULL))]]
+
+      I mean come on...
+      => No it wasn't but it's still awesome.
+
+*** DONE Why the SIMD instruction?				   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-25 Wed 16:36]
+    - State "ONGOING"    from ""           <2012-01-18 Wed 16:16>
+    - FROM: [[file:~/code/platform/mmap/memory_region.h::typedef%20uint64_t%20q2%20__attribute__((__vector_size__(16)))%3B][file:~/code/platform/mmap/memory_region.h::typedef uint64_t q2 __attribute__((__vector_size__(16)));]]
+
+    I believe the idea is that we can modify both start and length atomically?
+    Do the SIMD instruction really give this kind of guarantee?
+
+    => Yes it does aparently but only for aligned 16 bytes vectors.
+
+*** DONE What's the lock granularity				   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-25 Wed 15:51]
+    - State "ONGOING"    from ""           <2012-01-19 Thu 15:44>
+    - FROM: [[file:~/code/platform/mmap/gc_lock.h::struct%20ThreadGcInfo%20{][file:~/code/platform/mmap/gc_lock.h::struct ThreadGcInfo {]]
+
+    From what I read, it looks like the lock granularity is on the MemoryRegion aka the entire mmap area.
+    Seems like a concurrency buzz kill.
+
+    => It is on the entire MemoryRegion but it's not a concurrency buzz kill because of the way RCU stuff works.
+    Need to investigate further to get a better idea of this stuff (has to do with epoch count or something).
+
+    => RCU is awesome. It works in two part: the deletion and the reclamation.
+
+    - The deletion makes an object innacessible. It also grabs a count of all thread that were in a read
+      section at that moment. Note that we have to setup a new epoch for any thread that now enters the
+      a read-side cs after we took our sample.
+
+    - The reclamation occurs when the read count for an epoch reaches 0. At which point it's safe to delete
+      the object because nobody could have accessed it after it was made innaccessible.
+
+** Alloc Tasks
+*** DONE MemoryAlloc: More chunks size				       :task:
+    - State "DONE"       from "ONGOING"    [2012-01-24 Tue 18:04]
+    - State "ONGOING"    from "TODO"       [2012-01-16 Mon 14:30]
+    - State "TODO"       from ""           [2012-01-16 Mon 14:27]
+
+    To do fancier crap we need more then 32 & 64 memory chunks.
+    Start with 128 so we can implement N-ary Nodes.
+
+    First of all, we only do 64 currently. See: [[mmap:memory_allocator.cc::40][if (size != 64)]]
+    The memory allocator also makes the implicit assumption that every page is going to become a
+    64b NodePage64. This means that after a page has been allocated on the PT we have to mark it
+    full on all but the Nb FB struct.
+
+    Currently held up by the race condition caused when checking for the needUpdate flag.
+
+    => GenericNodePage expands and shrinks as needed.
+    MemoryAllocator is responsible for adjusting the size to our predetermined sizes.
+
+*** DONE PageAllocator::memoryRegion -> it's pure virtual?	       :task:
+    - State "DONE"       from "ONGOING"    [2012-01-18 Wed 13:58]
+    - State "ONGOING"    from "TODO"       [2012-01-18 Wed 13:58]
+    - State "TODO"       from ""           <2012-01-17 Tue 14:57>
+
+    PageTableAllocator is a subclass of PAgeAllocator.
+
+*** DONE MemoryAlloc: String Allocator				       :task:
+    - State "DONE"       from "ONGOING"    [2012-02-23 Thu 12:09]
+    - State "ONGOING"    from "TODO"       [2012-02-14 Tue 11:44]
+    - State "TODO"       from ""           [2012-01-16 Mon 14:30]
+
+    The idea is to be able to allocate chunks of memory of arbitrary sizes.
+    To make it work, we could use MemoryAlloc to get a small spot at the start of the page and use a free-list
+    or whatever to support the allocation of the rest.
+    There most definately are existing impl of stuff like this somewhere. Look it up.
+    Using locks is a bit more acceptable here.
+
+    The problem isn't making a free list allocator but making the free space visible
+    through the page table. Trickier but we do have an extra 944 bytes available in
+    PageTable and an FBM<1024> takes 132 bytes (we can add another 7 of them).
+
+    We could mark a page as full when it can no longer hold a contiguous page of size(order-1).
+
+    Seems like there's simply not enough space to be able to use the PageTable entry.
+    So what we could do instead is add a offset entry which would point to a big ass array
+    of short that contains the maximum number of contiguous pages
+
+    ------------------------
+
+    The idea is that we shove a free list pointer in the MD node which would make it global
+    to everyone. sort it (or RB Tree it) by space available. When there's not enough place
+    left over allocate a new node with about the right size and shove rest of the free space
+    in the free list.
+
+    ------------------------
+
+    So let's use the trie and be done with it.
+    Problem is that the trie is a set (as oposed to a multiset) which complicates searching for a
+    size. But if we index by offset, we need to finish implementing replace value. But this is
+    still foobared because replace value will replace regardless of what the old value was...
+    AAAAARG!
+
+    2 options:
+    - Index by offsets
+      + Would need to add a compareAndReplace operand to the trie.
+      + Optimized for deallocs which is just backwards of what we want...
+    - Index by size
+      + need to manage a list externally from the trie.
+      + Things get complicated if we ever want to clean up these lists.
+	+ Could just shove a lock and do a general cleanup.
+      + Otherwise it's a queue which is lock-free-able-ish? maybe?
+      + Worst case just shove a lock on that bucket or something.
+      + De-allocs would be a nightmare to implement...
+
+  ---------------------------
+
+  Current impl has a couple of issues to fix
+  - Figure out exactly what's going on with the root.
+     + I think we should add an func to Metadata to return the offset of the root.
+   - Sweep right de-alloc should do a straight up remove (no CAS)
+     + It's safe because the offset isn't about to move. So even if the value changes, remove
+       will return it and we're still fine.
+   - Look left should change
+     1. This depends on being able to do a reverse sweep.
+	+ If we can't then don't bother doing this. it would require multiple sweeps.
+     2. Make it sweep left
+	+ The idea is that we have better changes to coalesce the whole thing.
+	+ Stop if the cas ever fails. This means that an alloc went through and we can no longer
+	  merge with the block.
+	+ Handle page bound specially. Don't delete it and since it might pop up out of
+	  we should probably just handle it outside the loop.
+     3. Do it after sweep right
+	+ I think this is just to make it cleaner because of the ref to the page bound.
+   - Once we're done sweeping, just look at the total left-over size and it matches the order size
+     deallocate the page.
+
+  Don't forget to update the stats items (bytesAllocated et al.)
+  Also plug in the MemoryTracker for good mesure.
+
+  ---------------------------
+
+  Fix the trie concurrency test
+  Make a concurrency for the string alloc
+  Make the right sweep and check after deallocation if the new size is == orderSize then dealloc node.
+
+*** TODO startAt should be shifted right		       :bug:question:
+    - State "TODO"       from ""           <2012-01-16 Mon 15:51>
+    - FROM: [[file:~/code/platform/mmap/full_bitmap.h::int%20entry%20%3D%20findClearBit<uint32_t>(fullEntries,%200xffff,%20startAt)%3B][file:~/code/platform/mmap/full_bitmap.h::int entry = findClearBit<uint32_t>(fullEntries, 0xffff, startAt);]]
+
+    Currently the exact same value of startAt is used both to look up the fullEntries and the entries bitfield.
+    Since both arrays have different magnitude, it's unlikely that's it's supposed to be used twice unmodified.
+    Should shift right the value used for the fullEntries array.
+*** DONE Wasted memory by unused reserved pages for PTs	      :task:question:
+    - State "DONE"       from "ONGOING"    [2012-01-18 Wed 13:15]
+    - State "ONGOING"    from "TODO"       [2012-01-18 Wed 13:15]
+    - State "TODO"       from "ONGOING"    [2012-01-17 Tue 16:21]
+    - State "ONGOING"    from ""           <2012-01-17 Tue 14:01>
+    - FROM: [[file:~/code/platform/mmap/page_table_allocator.cc::getPageTableOffset(Page%20page,%20int%20order)][page_table_allocator.cc::getPageTableOffset(Page page, int order)]]
+
+    The idea is that at L1 where all the PTs are stored, we reserve the first 5-6 pages aligned with the
+    L2 pages for PTs. The problem is that L5 will only have one PT aligned with the beginning of L5.
+    And yet we still keep a spot reserved for it at every L2 aligned L1 pages. These reserved pages will
+    go unused.
+
+    This applies to L4, L3 and L2 as well and gets progressively worst as you move further in the tree.
+    At worst you'll only be using one of the 5-6 reserved pages.
+
+    Could be reclaimed by checking the alignment of the page (ntz) and adding to the offset accordingly.
+
+    => Actually the simplest solution is to just not mark the PT-less pages as full. Problem solved.
+    This is exactly what's done in [[mmap:page_table_allocator.cc::75][splitPage()]].
+
+*** DONE MemoryAllocator: deallocateNode doesn't attempt to deallocate the page :bug:question:
+    - State "DONE"       from "ONGOING"    [2012-03-05 Mon 10:13]
+    - State "ONGOING"    from "TODO"       [2012-03-05 Mon 10:13]
+    - State "TODO"       from ""           <2012-01-18 Wed 13:38>
+    - FROM: [[file:~/code/platform/mmap/memory_allocator.cc:://%20TODO:%20if%20the%20page%20is%20no%20longer%20full%20can%20we%20deallocate%20it...][file:~/code/platform/mmap/memory_allocator.cc::// TODO: if the page is no longer full can we deallocate it...]]
+
+    This should be a fairly simple operation if deallocatePage already exists.
+    On the other hand it's a bit tricky because we want to avoid allocating and deallocating the exact same page several
+    times in a row.  I don't think our use cases actually support that kind of behaviour but I may be wrong.
+    Fixing this issue is somewhat complicated.
+
+    => We no longer cas the sizes, we instead remove them in our sweap.
+    We can then safely check whether the free block we're about to re-insert is
+    the size of a page and deallocate the page if it is. Note that this is safe becase
+    we already have measures in place to mark page boundaries and get it's order.
+
+*** DONE GenericNodePage: Get rid of race condition with FullBitmap	:bug:
+    - State "DONE"       from "ONGOING"    [2012-01-24 Tue 18:04]
+    - State "ONGOING"    from "TODO"       [2012-01-23 Mon 16:56]
+    - State "TODO"       from ""           <2012-01-20 Fri 10:40>
+    - FROM: [[file:~/code/platform/mmap/node_page.h::struct%20GenericNodePage][file:~/code/platform/mmap/node_page.h::struct GenericNodePage]]
+
+    Implement a FullBitmap-like hierarchical tree in order to fix the race condition.
+
+    This can't be ignored and has to be fixed now because in
+    [[mmap:memory_allocator.cc::198][MemoryAllocator::deallocate]] it ends up calling mark FullBitmap::markDeallocated
+    which calls markBitmapNotFull. That call will loop forever until it's able to do
+    the deallocation.
+    If another thread swipped this from under his nose, we have a problem.
+
+    => FullBitmap now takes a template argument that shrinks and expands the bitmap
+    as needed. Note that if the bitmap fits on a single 64 bit word, it doesn't
+    use a 2 step hierarchy thingy anymore which saves space.
+
+    GenericNodePage can now use FullBitmap to solve the range condition.
+
+*** DONE GenericNodePage: Reduce memory usage for large NodeSize	:bug:
+    - State "DONE"       from "ONGOING"    [2012-03-05 Mon 10:15]
+    - State "ONGOING"    from "TODO"       [2012-03-05 Mon 10:15]
+    - State "TODO"       from ""           <2012-01-20 Fri 10:43>
+    - FROM: [[file:~/code/platform/mmap/node_page.h::struct%20GenericNodePage][file:~/code/platform/mmap/node_page.h::struct GenericNodePage]]
+
+    Figure out some way to not waste as much memory to the header on GenericNodePage.
+    This would probably mean spilling over into another page in some manner which is kinda awkward.
+
+    => This is partially solved by the string allocator so I'm not sure how useful this really is anymore.
+
+*** DONE FullBitmap: There's a race somewhere.				:bug:
+    - State "DONE"       from "ONGOING"    [2012-01-30 Mon 12:33]
+    - State "ONGOING"    from "TODO"       [2012-01-30 Mon 12:33]
+    - State "TODO"       from ""           <2012-01-24 Tue 18:07>
+    - FROM: [[file:~/code/mmap.org::*GenericNodePage:%20Reduce%20memory%20usage%20for%20large%20NodeSize][GenericNodePage: Reduce memory usage for large NodeSize]]
+
+    The mt test of fullbitmap raises this issue sporadically. Can't tell where it comes from exactly.
+
+    build/x86_64/tests/full_bitmap_test
+    Running 4 test cases...
+    MTFullBitmapTest<341>
+    was marked as no longer fullwas marked as fullwas marked as fullwas marked as fullwas marked as fullwas marked as full
+    was marked as no longer full
+    was marked as no longer full
+    was marked as no longer full
+
+    was marked as no longer full
+    was marked as full
+    was marked as no longer full
+    was marked as no longer full
+
+
+    was marked as full
+
+
+    ./mmap/testing/full_bitmap_test.cc(181): error in "test_full_bitmap_multithreaded": check num_errors == 0 failed [14 != 0]
+    num_allocated = 5930000 failures 0
+    num failed = 0
+
+    => Found a race condition in FullBitmap::markDeallocated()
+      see the doc of the function for more details.
+
+*** TODO Reduce the size of the MemoryTracker 			       :task:
+    - State "TODO"       from ""           <2012-02-08 Wed 16:57>
+
+    This is two folds:
+    - When it's not being used (could just use a pimpl and keep it null when not in use).
+
+    Would also be nice if it would use a rwlock instead of a full mutex.
+    boost::shared_lock didn't seem to work too good though.
+
+*** TODO Fix the page_allocator_test				       :task:
+    - State "TODO"       from ""           <2012-02-13 Mon 16:20>
+
+    That test experiences sporadic faillure. fix it at some point.
+
+    This was due to some "out of virtual memory" error which is kinda non-sensical.
+
+*** DONE Persist the MMap back to disk				       :task:
+    - State "DONE"       from "ONGOING"    [2012-03-14 Wed 11:30]
+    - State "ONGOING"    from "TODO"       [2012-03-14 Wed 11:30]
+    - State "TODO"       from ""           <2012-02-14 Tue 12:02>
+
+    This is a biggy. Currently because of our limitations with the OS we'll take
+    a simpler aproach of using a journal and doing our write backs manually to disk.
+
+    So everytime we write to the mmap, we add that node to the journal and then we do
+    periodic manual flushes to the file. Before we write though, we add the old node to
+    a another journal so that we can rollback the writes if something goes wrong.
+    When we're done with the write, we fsync to file and free up the journals.
+
+    There are issues with this approah. Essentially the mmap will be CoW which means that
+    if we attempt to persist the rcu lock in it, bad things happen.
+    -> Not quite. We can map diferent areas of the mmap with diferent protections which means
+    that we can shove the GcLock in a shared area while keeping the rest in a PRIVATE
+    area. Although the problem still remains with the memory allocators which can't
+    easily be moved to a SHARED area (the kernel only works on pages and nothing finer).
+
+    => First off, we're going to start off with a signle process (with multiple threads)
+    that can do write. This solves the problems with the allocators.
+
+    Next up, see the persistence section for a more detailed layout of the work to be done
+    related to this item.
+
+*** TODO RangeT::operator[] returns the index				:bug:
+    - State "TODO"       from "ONGOING"    [2012-03-13 Tue 09:50]
+    - State "ONGOING"    from ""           <2012-01-18 Wed 14:08>
+    - FROM: [[file:~/code/platform/mmap/memory_region.h::return%20index%3B][file:~/code/platform/mmap/memory_region.h::return index;]]
+
+    Shouldn't it be: return start + index  ?
+    Nobody seems to use the operator[] which is probably why it never blew up.
+
+    => It's a bug
+
+*** DONE Expose the region in a less obtuse way			       :task:
+    - State "DONE"       from "ONGOING"    [2012-03-23 Fri 13:32]
+    - State "ONGOING"    from "TODO"       [2012-03-23 Fri 13:32]
+    - State "TODO"       from ""           <2012-03-19 Mon 09:53>
+
+    Right now the snapshotting stuff is handled by the region and the only way to get to
+    the region is to access a member of the allocator class.
+
+    That's pretty crappy, especially considering that the name has a trailing underscore
+    which means that it should probably be private. Hell we probably don't want to give
+    full control of the region to the user.
+
+    Need something better.
+
+    => It's exposed through MMapFile now.
+
+*** DONE Automagically call install_segv_handler                     :task:
+- State "DONE"       from "ONGOING"    [2012-05-29 Tue 13:55]
+- State "ONGOING"    from "TODO"       [2012-05-29 Tue 13:55]
+    - State "TODO"       from ""           <2012-03-19 Mon 11:10>
+
+    Forgetting to call this function allows the gremlin to wreak havoc all over the place
+    and is guaranteed to make you deeply un-happy.
+
+    So it'd be nice if something somwhere would just be in charge of loading it up.
+    This will probably require adding the uninstall_segv_handler as well as a
+    is_segv_handler_installed.
+
+=> It's done everytime a snapshot is created. Also added a check to the signal
+installer to make sure we don't install it more then once.
+
+*** TODO Deallocating a trie without clearing it first = massive leak	:bug:
+    - State "TODO"       from ""           [2012-04-18 Wed 10:20]
+
+    I'm not sure whether I should do anything about this. Maybe I should just
+    shove an assert that the root == TriePtr() and leave it at that.
+
+* Gc
+** Gc Notes
+*** GcLock data layout 						       :note:
+    A given instance of GcLock keeps data in two places:
+      - Where-ever it was instanciated via the Data struct.
+      - In a vector for each thread via the static TLS gcInfo variable.
+
+    To access the data in the TLS struct, each instances of GcLock is given an id called index.
+    This index is unique to the instance and is allocated by ++ a global counter during construction.
+
+*** GcLock defered work -> Last out does the deferred work.	       :note:
+    The last person out should always be the writer thread (?).
+*** GcLock::Data::visibleEpoch -> More like invisibleEpoch	       :note:
+    e > visibleEpoch -> all the epochs that are visible.
+    e <= visible Epoch -> All epcohs that are no longer visible.
+** Gc Questions
+*** DONE GcLock is just a big complicated rwlock		   :question:
+    - State "DONE"       from "ONGOING"    [2012-01-26 Thu 16:12]
+    - State "ONGOING"    from ""           <2012-01-26 Thu 12:04>
+    - FROM: [[file:~/code/mmap.org::*Cache%20Line%20Size%20%3D%2064%20bytes][Cache Line Size = 64 bytes]]
+
+    - sharedCS sleeps if the exclusive bit is set.
+    - only sharedCS can move the epoch forward
+    - exclusiveCS keeps the exclusive bit set while in the CS.
+      * while in exclusiveCS the epoch will not move forward
+    - exclusiveCS calls visibleBarrier with the exclusive bit set
+    - visibleBarrier waits for visibleEpoch == currentEpoch
+      * waits for all readers to drain out (no new epochs can be allocated).
+
+    If we end up waiting for all the readers to drain out then this is just a glorified rwlock.
+    Also, There's no real point to defering the free of the data because all the readers have been
+    drained out and all new readers have been blocked. The writer could just free all the data the
+    moment it exits the CS. In fact I'm surprised the defering stuff even works.
+
+    Now the gc.cc file includes the urcu.h header which should be a proper implementation of rcu.
+    Problem is that gc.h is not enabled at all.
+
+    => So yes we fall into a rwlock pattern if we take the exclusiveCS but we only should do that
+    very rarely. Like when memory region is resizing or something equally drastic.
+
+    There's still the problem of the epoch not changing unless someone calls visibleBarrier
+    to let an epoch drain out. Need to make a test to verify how this works.
+
+    Also, gc.cc is an attempt to use the urcu stuff but it either failed is incomplete.
+
+    => Actually, no. There's no such problem.
+    When you move on to a new epoch, the count from the previous epoch can only go down and will
+    eventually reach 0 (assuming no deadlock, or catastrophic events).
+    When you reach 0, the epoch is incremented and things continue going on properly.
+
+** Gc Tasks
+*** TODO Deferred::runAll -> Ignores thrown exceptions.			:bug:
+    - State "TODO"       from ""           <2012-01-26 Thu 11:08>
+    - FROM: [[file:~/code/platform/mmap/gc_lock.cc::void%20runAll()][file:~/code/platform/mmap/gc_lock.cc::void runAll()]]
+
+*** DONE Fix the wrapping epoch problem				       :task:
+    - State "DONE"       from "ONGOING"    [2012-03-23 Fri 13:30]
+    - State "ONGOING"    from "TODO"       [2012-03-13 Tue 11:02]
+    - State "TODO"       from ""           <2012-01-25 Wed 16:31>
+
+    Use the same trickery as the yarn timestamp thingy.
+
+    It actually happened... Wow...
+
+    => It's fixed using my old yarn_timestamp_comp function.
+
+*** TODO Persist the GCList and make it visible to everyone	       :task:
+    - State "TODO"       from "ONGOING"    [2012-02-13 Mon 15:10]
+    - State "ONGOING"    from "TODO"       [2012-02-13 Mon 12:26]
+    - State "TODO"       from ""           [2012-01-16 Mon 14:43]
+
+    The idea is to allow other threads to recover in the case of a thread crash.
+    Same but with a program during a full program crash
+
+    Would also be nice if GcList could be generi-ified by handling only offsets.
+    Could allow it to be used in other situations.
+
+    First off we have to setup of TLS mechanism in order to make the GcLists
+    visible to everyone. Best way to do this is to use those metadata pages
+    at the begining of the mmap. The first one is reserved to COWRegions so
+    no go but the second one seemed  to have been reserved for this so weee!
+
+    Layout of that page would go something like this:
+
+    struct entry {
+      int tid;
+      uint64_t offset; // for the moment, only a GcList will go in there.
+      double lastAccessed; // For Gc purposes.
+    }
+
+    struct ThreadRegion {
+      FullBitmap spots
+      uint64_t gcList;
+      struct entry [X];
+    => Shelved for the moment but see git stash for the thread_page.h file
+    };
+
+    To deal with data from dead processes, when trying to add a new entry and
+    the fbm is full, start scanning the list for an entry with an old lastAccessed.
+    Make a copy of the entry, cas the lastAccessed and shove your values in there.
+    move the copy to the gcList struct for later gc.
+
+*** DONE Persist the GCLock within the MMap			       :task:
+    - State "DONE"       from "ONGOING"    [2012-03-29 Thu 10:48]
+    - State "ONGOING"    from "TODO"       [2012-03-29 Thu 10:48]
+    - State "TODO"       from ""           <2012-02-23 Thu 12:57>
+
+    This mostly consists of the Data DS.
+    The deferred list aparanelty doesn't need to go in. I'm not sure if I agree.
+      Will have to dig a little deeper.
+
+    There's one hell of a problem with this. If the mmap is COW then persisting the gcLock
+    in there is an incredibly bad idea because both the writer and reader locks modify the lock.
+    This means that whenever somehow tries to enter a CS, we make a copy of the lock to be used
+    by that process. As you may have guessed, this is somewhat of an issue.
+
+    Actually you can map different portions of the same file differently. So you can have a
+    MMAP_SHARED region and still be able to CoW the other region.
+
+    => It's actually better to put it outside the mmap. The reason is that if something
+    goes wrong it can be easily deleted. Also, to access stuff in a MemoryRegion, you
+    to have a gc lock. This could kinda maybe somehow complicate things...
+
+*** TODO GcLock test fails every once in a blue moon			:bug:
+    - State "TODO"       from ""           <2012-03-29 Thu 10:47>
+    - FROM:
+
+    test output:
+
+    testing synchronized GcLock
+    0.443799 thread 1: invalid value read from thread 0 block 1: -1
+    epoch -1072639124 in 0 in-1 0 vis -1072639124 excl 0
+    deferred: 0 epochs:
+    ./mmap/testing/gc_test.cc(585): error in "test_gc_sync": check nerrors == 0 failed [1 != 0]
+    allocs 3961240 deallocs 3961240
+    highest 8
+    gc.currentEpoch() = -1072639124
+* Optimization
+** Opt Notes
+*** GcLock::updateData() 					       :note:
+Some quick profiling showed that updateData() is using 20-30% of the time
+in the trie.
+
+Jeremy mentionned some possible shortcuts within the enterCS methods that
+could avoid the expensive CAS in updateData. Further investigation required.
+
+** Opt Questions
+** Opt Tasks
+*** TODO Resize grows by more then one page at a time		       :task:
+- State "TODO"       from ""           <2012-03-29 Thu 15:57>
+
+Currently there's a bottleneck on the region's mutex. Both the snapshots and the resizing
+share the same mutex which means that on tests that try to spam a lot (like they should)
+are incredibly slow. This could also be an issue in production but it's hard to tell.
+
+The reason why it's slow is because when resizing, we only expand by one page at a time
+(I THINK) and because snapshots are pretty long to take. So one way to fix this is to
+make resizing do more then one page at a time (like let's say 4mb at a time). This should
+alleviate some of the pressure on the mutex.
+
+Note that it MIGHT be possible to give snapshots their own mutex. I don't remember how good
+my reasons were to make them share mutexes.
+*** DONE Optimize Key Fragment                                       :task:
+- State "DONE"       from "ONGOING"    [2012-05-28 Mon 13:12]
+- State "ONGOING"    from "TODO"       [2012-05-28 Mon 13:12]
+- State "TODO"       from ""           <2012-05-10 Thu 15:13>
+
+Latest profiling shows that KF is now that top bottleneck.
+
+Seems to revolve around:
+- Copies of compact_vector (tcmalloc new & copy constructor)
+- calls to copyBits (copyBits & getBitVec)
+
+=> Most of the copy calls came from the removeBit function. So I added a
+startBit index which avoids the copy in that instance. Problem mostly
+solved. Could still do more but moved on to better and greater things.
+
+*** TODO GcList: compact_vector<pair> -> ML::lightweight_hash        :task:
+- State "TODO"       from ""           <2012-05-28 Mon 13:06>
+
+Problem with searching the newNodes list on a compact vector is that it might
+not scale to well if the list gets big.
+
+I don't have any measurements yet but the list could get potentially get quite
+big if the lifetime of a transactional trie version ends up lasting for a long
+time.
+
+Now we can't use std::unordered_map or std::map because there destructors takes
+a looooooooooooooooooooong time to complete and pretty much destroys the
+performances of the mutable trie version.
+
+Turns out that JML has a hash container that could potentially fix that
+problem. So try to replace the compact_vector<pair> with ML::lightweigth_hash
+and see how that holds up.
+
+* Persistence
+** Persistence Questions
+*** DONE Why reclaim a snapshot?				   :question:
+    - State "DONE"       from "ONGOING"    [2012-03-14 Wed 14:54]
+    - State "ONGOING"    from "TODO"       [2012-03-14 Wed 10:43]
+
+    Do we really want to keep a snapshot around of the memory region at time t?
+    If so, just reading from the snapshot after the remap is not enough. You have
+    to actually write to it to get you're own copy. In fact you have to write to
+    every damn page otherwise if any of the pages gets written to with a sync_to_disk
+    call, then when the snapshot reads from that page it will read that new data.
+
+    Also a snapshot is not really re-usable. The whole reason for forking is that
+    only the pages that have been CoWed in the parent process will be present in
+    the child. This makes identifying the writes really fast and cheap.
+
+    So after checking out the tests, it looks like he wants it both ways:
+    1. Take a snapshot, do a bunch of writes, then write back the modifications, reclaim the snapshot.
+    2. Do some writes, take a snapshot, then write back the modifications.
+
+    The problem is that in the first case, the modifications to write are not in the
+    snapshot (they're in the original mapped region) while in the second case the
+    modifications ARE in the snapshot. The snapshotting code doesn't make that
+    distinction and well reclaiming is basically a useless op because of it.
+
+    My guess is that this was a failed experiment and that I should just ignore
+    snapshot reclaiming altogether.
+
+    => Experimental. Jeremy doesn't really remember what it was for.
+    It fell within one of my though aboves but may not have ever worked.
+
+    In any case, I can disable the code that does this stuff for now and move on.
+
+*** TODO How safe is the segv lib				   :question:
+    - State "TODO"       from ""           [2012-03-15 Thu 13:28]
+
+      Does it handle the case where a segfault is triggered but before it reaches the handler,
+      the region is unregistered?
+
+      The whole lib makes debugging with gdb annoyingly hard.
+
+** Full Private Mapping
+*** DONE One Process						       :task:
+    - State "DONE"       from "ONGOING"    [2012-03-21 Wed 13:24]
+    - State "ONGOING"    from "TODO"       [2012-03-21 Wed 13:24]
+    - State "TODO"       from ""           [2012-03-13 Tue 13:52]
+
+    Start by supporting everybody cooperating within a single process.
+    We do this using the current snapshot lib which I have to finish testing.
+
+    The idea is that we periodicaly or after every write, create a snapshot that we can
+    then compare to a previous snapshot to decide what to write.
+    Will require quite a bit of modifications to get this right.
+
+    We then have to start creating a write back mechanism. One options looks like this:
+    - Diff the modified pages using the snapshot thingy.
+    - For each modified page, do a binary diff with the original page to find what changed.
+    - Write a journal with the diffs and fsync it to disk. This can reside in it's own file.
+    - Add a done marker to the journal. (doesn't need to be fsync ?).
+    - write the modifications to the file.
+    - Delete the journal.
+    - Dance.
+
+    Be careful with the GcLock. Gotta think a bit more about how it will behave.
+
+    Multi-thread behaviour:
+    - do some writting
+    - grab a lock.
+    - snapshot with worker
+      - worker writes back the page to the disk doing the diffing and journalling and whatnot.
+	The snapshot's version of reality WILL NOT CHANGE. which is all kinds of awesome.
+    - reback the process map -> Necessary otherwise the next snapshot will have the
+    - drop the lock
+    - Keep on doing whatever.
+
+    Note that it's safe to do the write back to disk async and keep doing whatever in the main thread.
+    If the main thread touches a page held by the snapshot, then it will get CoWed which is just
+    awesome and it preserves the content of our snapshot.
+
+    Should take a look at the redis persistence mechanism since it uses something like this.
+
+    Note that still doesn't really adress the problem of making consistent writes with N writer
+    threads. One way or another we'll have to do a stop the world event (gc lock exclusive probably)
+    every once in a while to do a snap shot.
+
+    Problem with reback:
+    - so you do a bunch of writes followed by a snapshot.
+      - If you were to keep going, the next snapshot would contain all the pages from the old snapshot.
+    - To avoid that, you reback the original file.
+      - If you just reback the original file, you'd be pointing it to the old version of the data that's
+        in the process of being written!
+    - To avoid that you have to wait till the write is complete before you can do the reback.
+    -> at which point you better be ready to take a perf hit.
+
+    Turns out that proper snapshotting with multi writer is not an issue:
+    The reason is that the trie has a linearlization point that is atomic and that write is the last thing
+    we do. This means that any writes we do before that will not be visible. They may cause a leak but that
+    can be fixed in an offline or maybe even an online mechanism. Note that this also applies to embded tries.
+
+    Note that I THINK it might be a good idea to not run the gc until the snapshot after the root was comitted
+    the idea is that we don't want to start deallocating nodes before the root is written out.
+    -> Actually no. If nobody can reference the node (guaranteed by RCU) then who cares when it's written.
+    -> Actually YES!!!!! See that other task thingy entry.
+
+    -> Do some thinking about the atomicity of a fork. The bad part would be when it's cloning the page table.
+    if it doesn't have a lock, it could go wrong?
+
+    => Finished and working. Woo!
+
+*** DONE Test robustness of the saving mechanism		       :task:
+    - State "DONE"       from "ONGOING"    [2012-04-17 Tue 10:21]
+    - State "ONGOING"    from "DONE"       [2012-04-11 Wed 13:49]
+    - State "DONE"       from "ONGOING"    [2012-03-30 Fri 16:34]
+    - State "ONGOING"    from "TODO"       [2012-03-30 Fri 16:34]
+    - State "TODO"       from ""           [2012-03-29 Thu 10:54]
+
+    Essentially figure out a way to crash the process in the middle of a write to memory and/or to disk.
+    Gotta be damn sure that the file won't be corrupted under any circonstances.
+
+    The tricky part here is to somehow tell the OS to discard it's page cache of the file. Even if we
+    crash a process, the page cache for the file will still remain and there's no guarantee that the actual
+    file on the disk has been properly updated. Short of kernel panic, I don't really know how to achieve
+    this.
+
+    => Haven't found a way around the page cache problem but as long as
+    fdatasync works as advertised there shouldn't be any problem. In any case,
+    crashing the proces doesn't seem to corrupt the mmap file so we're good.
+
+    The test could be augmented to keep re-using the same mmap file everytime
+    but that's considerably more complicated to do.
+
+    => Turns out there was still a problem with the reback mechanism on large
+    files ( > CHUNK * page_size). The file pointer wasn't being updated
+    correctly.
+
+    => Journalling seems to fix everything.
+
+*** ONGOING N Reader Processes + 1 Writer Processes		       :task:
+    - State "ONGOING"    from "TODO"       [2012-03-21 Wed 14:42]
+    - State "TODO"       from ""           [2012-03-13 Tue 13:52]
+
+    Scale the previous thingy so that many process can read from the file.
+    This will mean seperating the GcLock's into their own area of the file which will
+    be mapped shared. It also means making sure that no reader end up triggering a Gc.
+
+    We also need the write process to be universely known so that the read processes
+    can reback their range once a modification takes place.
+
+    Probably another bajillion details that I'm not thinking about right now.
+
+    The biggest problem here (one that might not be efficiently solvable) is how do we make writes visible
+    to all the readers?
+
+    The basic premise is that the write process will have it's own private pages that are not visible to
+    anyone else. So in order to make them visible we need to write back to the file. At this point there's
+    2 scenarios here and I'm not sure which applies but they're both a problem:
+
+    1. The writes are immediatly visible to the read processes. If that's the case then we have no control
+       over what is written where first. Meaning that if we write the root before we write the nodes under
+       the root, we're kinda screwed.
+       => THIS THE CORRECT BEHAVIOUR!
+
+    2. The writes trigger a CoW on the reader side which makes them still not visible. At this point the
+       writer has to signal to the readers that they have to reback their pages which is easy. The problem
+       comes from which page do we reback first? That is to say that it's the exact same problem as 1.
+
+    There might be one way to get around this by exploiting the linearlizability (I made up a word, deal
+    with it) of the trie. That is to say that we could segregate all the roots of the top level tries into
+    their own little ghetto page and make sure that they are written last. There might be issues with
+    ordering; that is to say that the writes to a given trie might be visible before writes to another
+    trie. Might be an issue when we support multiple tries.
+
+    Note that the readers don't give a crap about the allocator structures so even if all the page tables
+    are written out of sync, there's no issue. That also means that the issue of atomicity related to the
+    trie roots don't apply to the string allocator.
+
+    Note that embded tries aren't an issue because writes in them won't be visible until the top level trie
+    is visible. So no worries there.
+
+    Match plan:
+    - GcLock
+      - Make the GcLock persistable while keeping it's interface
+      - Allocate a page somewhere that can be MAP_SHARED seperatly
+      - Make everyone use the new persisted version.
+      - Make it possible to not trigger a Gc passes on read-side CS exits
+      - Mostly maintain the current interface.
+    - Trie Roots
+      - Allocate the roots into their own ghetto pages.
+      - Make sure the ghetto page is saved last by snapshot (end of address range will do that for free).
+
+    Snapshotting the trie root page is actually a bit more complicated then I first though. Essentially:
+
+      mainArea.snapshot();
+      rootArea.snapshot();
+
+    This won't work because if a thread writes both nodes and a root between the 2 snapshots, we're screwed.
+    So the new algo goes a bit like this:
+
+      rootArea.snapshot();
+      mainArea.snapshotAndWriteBack();
+      rootArea.writeBack();
+
+    This should magically work. Worst case, we snapshot a bunch of extra nodes that aren't attached to a
+    root which is what we were going for anyway. Although to do this cleanly without further butchering
+    of the existing region interface will require merging the trie root page back into the main page.
+    Which is fine by me because we were planning on doing that already so weeee!
+
+    TODO:
+    - Make it so that all processes who create a Trie object with the same id will share the same gc object
+      Right now, every call to MMapRegion::gcLock(id) will create a new object.
+      => DONE - There's now an array in MMapRegion which gcLock(id) uses to store openned gcLocks for a process.
+    - Fix the snapshotting
+      => DONE - Everything is in one region now so I force the node writes before the root writes.
+    - Have the write thread do the deferred gc.
+      => DONE
+
+    Just gotta test it now... What could possibly go wrong?
+    -> There's a segfault left over as well the bug described just below.
+
+    ---
+
+    The new journalling mechanism has the same issue as above. Because it writes
+    out the writes in sequential order, it ends up writting roots before any
+    of the nodes under it. Which is bad. So gotta make it aware of address
+    ranges.
+
+*** DONE Resizes aren't visible across multiple processes             :bug:
+- State "DONE"       from "ONGOING"    [2012-05-29 Tue 13:53]
+- State "ONGOING"    from "TODO"       [2012-05-29 Tue 13:53]
+    - State "TODO"       from ""           <2012-03-28 Wed 15:13>
+    - FROM: [[file:~/code/platform/mmap/memory_region.h::ExcCheckLessEqual(startOffset%20%2B%20length,%20this->length,][file:~/code/platform/mmap/memory_region.h::ExcCheckLessEqual(startOffset + length, this->length,]]
+
+    If a thread resizes all the other threads won't see it and explode when accessing
+    a region outside their mmap-ed region.
+
+    this check is made in MemoryRegion::State::range() and we should just call something
+    like grow to remap the file upwards. It's a little trickier then that because we don't
+    want to end up calling ftruncate so we have to be careful.
+
+=> If the check fails it just goes for a resize. This introduces a number of
+very tricky problems though for multiple write processes.
+
+*** TODO Reduce the number of files				       :task:
+    - State "TODO"       from ""           <2012-03-27 Tue 10:56>
+
+    So right now we have:
+    - gc() = base + boost ipc = 2
+    - region() = file + boost ipc + gc() = 1 + gc()
+    - root(n) = n * gc()
+    => file_count() = 2 * region() + root(n) = A LOT
+
+    So it wouldn't hurt if we could bring this down a little bit.
+
+    The root file will eventually be stored int he mmap to simplify things so that helps.
+
+    Should look into storing the gc into the mmap as well but that's trickier because they
+    have to be mapped as SHARED. This should also wait till we figure out how we're going
+    to do robustness in there. If a thread dies while holding a gc lock, we have to somehow
+    recover (same applies to a boost ipc lock).
+
+    Storing the boost ipc along with everything else would also be a big boost. Fairly
+    simple to do with gcLock, considerably more complicated with regions. Then again
+    just doing it for gcLock would be a giant improvement.
+
+    => Trie root has been merged back into the trie so that removes 4 files. Goot start.
+
+*** DONE Snapshot doesn't fsync					       :task:
+    - State "DONE"       from "ONGOING"    [2012-04-10 Tue 10:45]
+    - State "ONGOING"    from "TODO"       [2012-04-10 Tue 10:45]
+    - State "TODO"       from ""           [2012-03-28 Wed 14:00]
+
+    It would be nice if we could be sure that the data was safe and sound before continuing
+    to fubar everything.
+
+    => fsync is now called within the snapshot's forked process after all the writes.
+    Used fdatasync instead of fsync because it doesn't write any metadata and was
+    considerably faster in my eyeballing tests. Might want to be a little more scientific
+    about it.
+
+*** DONE Does the write process properly execute deferred work?		:bug:
+    - State "DONE"       from "ONGOING"    [2012-04-10 Tue 11:57]
+    - State "ONGOING"    from "TODO"       [2012-04-10 Tue 11:57]
+    - State "TODO"       from ""           [2012-04-10 Tue 10:41]
+
+    The idea was that the write process already did a lot of pin/unpin which meant that
+    we didn't have to do any special calls to the gc lock to execute deferred work.
+
+    What I'm wondering is whether all that pin/unpin is done on the memory region or the
+    trie? Because if it's done on the memory region then we won't gc anything.
+
+    I think this should be fine because MutableTrieVersion is a subclass of ConstTrieVersion
+    meaning that it should inherit it's pinning behavior and should gc when the obj
+    is destroyed or reseted.
+
+    Gotta double check to be sure.
+
+    => Yup, mutable works the same as const so we're all good.
+
+*** TODO Read threads should ideally not do defer work		       :task:
+    - State "TODO"       from ""           <2012-04-10 Tue 15:38>
+
+    The reason is that we want to keep reads as fast as possible and not end up with huge
+    perf spikes because of a gc run.
+
+    SharedGcLock and GcLockBase already take an argument at construction that prevent that
+    instance of the GcLock from doing defered work. Using that has several problems though.
+
+    Right now memory region makes sure that each process only had one instance of a gc lock.
+    I think I implemented that so that the defered list would be visible across all write
+    threads within a single process. To get around this, we'd need to persist the defered
+    list or share it amongst multiple objects. Persisting wouldn't work if we're talking
+    about the simple GcLock which has nowhere to persist to. In any case, a bit of a problem.
+
+    Note that we could defer the defer work to a backgroun thread that does only that. This
+    means that if extending the no defer logic to readers conflicts with the writers, then
+    we can simply convert writers to the no defer logic as well. Very likely to happen when
+    we start screwing with the gc logic in the trie.
+
+*** DONE Gc And Snapshot issue						:bug:
+    - State "DONE"       from "ONGOING"    [2012-04-17 Tue 10:20]
+    - State "ONGOING"    from "TODO"       [2012-04-17 Tue 10:20]
+    - State "TODO"       from ""           <2012-04-11 Wed 13:52>
+
+    So there's a concurrency problem with regards to the gc and snapshots:
+    1. root on disk and RAM points to block A
+    2. New root is created in RAM labeled block B
+    3. root in ram is updated to point to block B
+    4. gc runs and reclaims block A
+    5. block A is reallocated and relabelled as block C
+    6. heap is snapshotted to disk.
+
+    The keen observer might have noticed that there's a massive problem here.
+    Essentially the root on disk points to a different location then what's on
+    RAM. We also just overwrote what the old root was pointing to with
+    something completely unrelated.
+
+    That means that when we snapshot the heap before snapshotting the roots
+    we get a root that points to the wrong thing. Oops!
+
+    Essentially the gc lock doesn't account for what's on disk. So we can end
+    up exiting a read-side critical section while something on disk still has
+    a reference to something that we consider to have no more references.
+
+    In any case, this kinda suck.
+    - One solution would be to never automatically run the gc but do it manually
+      after every snapshot.
+    - Another would be to make the region enter a read-side CS and cycle it
+      (unlock then relock) after every snapshot.
+
+    The problem with this is that we're tying gc runs with snapshots pretty
+    closely. This means that we can't make a snapshot every hour or so because
+    the region will get overrun with garbage data.
+
+    The more radical solution would be to get rid of the 2 step disk write but
+    that involves A LOT of work. Essentially we have to add journalling to the
+    snapshotting process. That alone is a good amount of work to write and
+    execute.
+
+    => Our current fix is to switch to the journalling mechanism.
+
+*** DONE Automatic Journalling					       :task:
+    - State "DONE"       from "ONGOING"    [2012-04-17 Tue 10:15]
+    - State "ONGOING"    from "TODO"       [2012-04-13 Fri 09:34]
+    - State "TODO"       from ""           [2012-04-11 Fri 09:33]
+
+    The idea is to have the snapshot write a journal of the entire mmap file
+    before executing the write to the disk. This is an alternate solution to
+    the 2 phase snapshot.
+
+    This ensures that if at any moment, the writing to disk fails in any way,
+    we can still recover the mmap file using the journal. It also solves gc
+    problem of the 2 phase snapshot because if we crash, the mmap can be
+    returned to a consistent state using the journal (2 phase snapshot
+    assumed that it was always consistent which turned out to be false).
+
+    It can also be made to work on multiple reader processes as long as we can
+    guarantee that the roots are written last. Currently we enforce this by
+    applying the journal entries in backwards order meaning that the low adresses
+    will be the last to be written out (roots are on the first page). I think
+    that this solution is pretty bad because doing our IO backwards is probably
+    not a very good idea.
+
+    If the backwards thing doesn't work, just make the journal aware of the
+    adress range that has to be written last. We could also add an ordering API
+    of some sort if we want to hold on to the illusion of genericity. Probably
+    just a better idea to just include trie_allocator.h and use it's enum
+    directly. We can get fancy later when it's really needed.
+
+    => It all works. Although it would be nice to get rid of the fstream stuff.
+
+**** DONE Fix mmap_region_test						:bug:
+     - State "DONE"       from "ONGOING"    [2012-04-17 Tue 10:16]
+     - State "ONGOING"    from "TODO"       [2012-04-13 Fri 17:46]
+     - State "TODO"       from ""           [2012-04-13 Fri 17:36]
+
+     So killing the forked process isn't enough. We also have to kill all the
+     child process of that process. Some possible options:
+
+     - Set a process group and then kill the whole group (might need root).
+     - Read proc files... Oh wait, I was looking for solutions...
+     - Something using pipe to communicate (I think it would require spinning
+       extra threads).
+     - Out of bound mechanism using files or something to then self-kill.
+       Problem is that I don't think forking preserves the threads.
+     - Magic... BLACK magic...
+     - At fork callback. Could be used to spin up threads.
+
+     => Fixed the problem using pipes and pthread_atfork. So the idea is to
+     create one pipe between the original process and the test process and
+     one pipe between the test process and the snapshot process. We then
+     spin up a background thread in the test process and each snapshot process
+     to listen on the pipe. In order to spin up threads on the snapshot
+     processes we use pthread_atfork within the test process.
+
+     So in other words, BLACK MAGIC.
+
+** TODO Shared + Private Mapping				       :task:
+   - State "TODO"       from ""           [2012-03-13 Tue 13:53]
+
+   Mostly an experiment to see if we can multiple writers (MAP_SHARED) that take periodic snapshots
+   of the file (MAP_PRIVATE) and then compares the two to do what was described above.
+
+   I tried this with MAP_ANONYMOUS and it didn't work. It might work if the mapped regions are
+   backed by a real file.
+
+** TODO Manual Journalling					       :task:
+   - State "TODO"       from ""           [2012-03-13 Tue 13:53]
+
+   shm files that are mapped anonymous into each processes. We then use segv handlers
+   to detect reads to the area and load the data from the file. We then use segv handlers
+   again to detect writes to pages and mark the page as dirty.
+
+   Signals are probably too slow so it's probably not a workable solution.
+
+** TODO BTRFS							       :task:
+   - State "TODO"       from ""           [2012-03-13 Tue 13:53]
+
+   Experiemtn with BTRFS' CoW mechanism to take care of the entire persistence for us.
+   Problem is that the CoW mechanism works on blocks which could be a little too much
+   and too often. Making it not very good for an RT environment. We also don't have
+   much control over which thread is blocked.
+
+** Kernel
+*** TODO DENY_WRITE						       :task:
+    - State "TODO"       from ""           [2012-03-13 Tue 14:08]
+
+    See the original mmap DENY_WRITE flag to see if something can't be salvaged from it.
+    There's a good chance that it will stop ANY process from writting to the file so
+    that would be bad. Could still give some pointers on how to get an eventual kernel
+    patch to work.
+
+*** TODO Module that messes with the VMA flags			       :task:
+    - State "TODO"       from ""           [2012-03-13 Tue 14:09]
+
+    See if we can't have a module in the background that messes with the VMA flags
+    or the page_cache flags to emulate our desired behaviour. That is to say, stop
+    the kernel from automatically syncing the pages back to disk.
+
+*** TODO Module that introduces a mmap_recoset 			       :task:
+    - State "TODO"       from ""           [2012-03-13 Tue 14:11]
+
+    Essentially introduce a new system call via a module. This system call would
+    do whatever we need it to do as well a reusing a maximum of the existing
+    mechanic of mmap.
+
+*** TODO Kernel patch to modify mmap2 				       :task:
+    - State "TODO"       from ""           [2012-03-13 Tue 14:13]
+
+    Last ditch options is to modify mmap directly.
+
+** TODO FS/Fuse							       :task:
+   - State "TODO"       from ""           [2012-03-13 Tue 13:53]
+
+   Vague idea to map an artificial file into memory. This file would be managed by our
+   own block device or filesystem. No idea whether this has any merits.
+
+   Note that Fuse = Fast Userspace Filesystem.
+
+

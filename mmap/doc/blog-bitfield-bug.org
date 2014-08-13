@@ -1,0 +1,249 @@
+#+TITLE: Tales from debugging hell - Part AAAAAAAARG!
+
+This article will be about pain. The kind of pain that can only be experienced
+when spending several weeks debugging a freakish concurrency issue only to realize
+how horribly obvious the original error was. Brace yourself, this is going to be
+ugly.
+
+* Context
+
+This all started when I attempted to integrate our new-fangled datastore into a
+production environment. The idea was to have a quick replacement for an existing
+solutions that was starting to give us a lot of trouble. We were also hoping to
+shake out some bugs and interface issues that our test suite might have missed. 
+
+So I wrote up the code with some extra safety measures against crashes and data
+corruptions and, once I was satisfied, it was deployed into production. I
+watched it run for a couple of hours and since everything looked fine, I called
+it a day and left for the evening...
+
+The next morning I logged into the server and to my great surprise, the server
+wasn't experiencing a complete meltdown. In fact, evertyhing seems to have been
+running pretty smoothly and the database was accumulating keys at a decent
+rate. Since I figured this was a little anti-climatic, I decided to dig a little
+further which is when I came accorss this graph:
+
+# INSERT the restart graph from graphite... If we still have it...
+
+So those blue vertical bars indicate an instance where the service restarted.
+While that's an awful lot of restarts, the service was instantly restarted and
+kept on trucking without problem. Well until the next restart that is. Oh and
+notice how several hours can seperate those crashes? Well this needed to be fixed
+regardless so time I put my debugging cap on and went bug hunting.
+
+* The Hunt is on!
+
+First things first, log files. What I found was actually various asserts being
+triggered all over the trie that makes up the main data-structure of our
+datastore. From experience, I could tell that these were the tell-tale sign of
+data corruption.
+
+Data corruptions issues are pretty hard to debug because it's difficult to
+traceback the original source of error. A typical scenario is that a small error
+in a write will end up corrupting a small chunk of memory which, when read back,
+will fail in all sorts of unpredictable manner. Usually, you'd debug this by
+setting up a test case that can reliably reproduce the bug and slowly make your
+way back to the original screwed up write. 
+
+Seemed like a good place to start so I recorded a sequence of writes to the
+datastore that lead up to the bug. I then set up a small test to play back the
+writes and... The test finished successfully without crashing.
+
+Why? Well our datastore was designed to support multiple conccurent read and
+write threads using lock-free algorithms. As you may have guessed, this feature
+slightly complicates things. If a single thread isn't capable of reproducing the
+error then the bug has to be in the interaction of the multiple threads. The
+*non-deterministic* interaction. Well this should be fun.
+
+At this point, I wasn't overly concerned; I've dealt with these types of bug
+before and I developped several tools to help me do just that:
+
+- Asserts scattered throughout the code. This is what detected the problem in
+  the first place.
+- An analogue to valgrind's memcheck which keeps tracks of all allocations and
+  deallocations. It then uses that information to validate any read or
+  writes. Errors are then displayed with backtraces of the last
+  allocation/deallocation.
+- Sentinel bytes added to the begining and end of an allocated piece of
+  memory. This will detect any writes past the end of a allocated chunk of
+  memory as well as ensure that reads outside the memory boundaries will hit on
+  garbage data.
+- An fsdsk like utility which crawls the trie and individually validates each
+  nodes to ensure that they're in a sane state. It can also be used to cut out
+  corrupted subtrees of the trie to do partial recovery.
+
+What all these tools have in common is that they can be used to detect errors in
+the trie. While it doesn't guarantee that we get a hit on the source, it does
+shorten the timeframe which makes it easier to walk back to the error. In the
+case of my bug, this ended up pointing me directly to a small but crucial
+function of our trie.
+
+* Introduction to our trie
+
+The function in question is called getCurrentRoot()[fn:1] and is responsible for
+reading the root of the trie. Nothing too exciting there and the code is also
+fairly simple:
+
+#+BEGIN_SRC c++
+  TriePtr* getRootPtr() const;
+  
+  TriePtr getRoot()
+  {
+      return *getRootPtr();
+  }
+  
+  TriePtr getRoot() const; // Idem
+#+END_SRC
+
+What's important here is that since we allow multiple reader and write threads
+
+#+BEGIN_SRC c++
+  struct TriePtr
+  {
+      union {
+          struct {
+              uint64_t metadata:7;
+              uint64_t offset:57;
+          }
+          uint64_t bits;
+      };
+  };
+#+END_SRC
+
+Before we go on, I'd like to mention that I've now given you enough information
+to figure out the bug. I'm not going to spoil it but, in retrospect, it's
+incredibly obvious.
+
+#+BEGIN_SRC c++
+  TriePtr oldRoot; // Defined elsewhere.
+  
+  bool setRoot(TriePtr newRoot)
+  {
+      return ML::cmp_xchg(*getRootPtr(), oldRoot, newRoot);
+  }  
+#+END_SRC
+
+
+* Steps
+- Integrate DasDB into production program
+- Crashes after several hours
+- Usual debugging technic includes brute force which doesn't work too well now
+- Tried recording the sequence of inserts that led to the problem and played
+  them back... Didn't help.
+- Develop new tools which don't work either. Blind spot at the root.
+- Shove some printf in setRoot() and current()
+- Bug goes away...
+- Remove print statements and bug comes back... Oh crap...
+- Look at TriePtr and hypothetize about the union UB
+- Make the change and bug goes away. YAY!
+
+- But wait... Is it really gone or are we just masking it like the printf did?
+- Break out objdump and dump the setRoot part
+- all and yet the old version is strangely more complicated then it should be.
+- Hypothize about the possibility of reading as a bitfield turning into 2 reads.
+- Try to look at the current() function in libmmap.so but only find one.
+- And it's assembly is correct. Damn
+- Maybe it's in the other so file?
+- Yup, but it's still correct! Double Damn.
+- Well might as well look at the last one...
+- It's screwed up! Woo!
+
+* Snippets
+** Important bit
+RegionPtr<TriePtr> -> RegionPtr<uint64_t>
+rootCopy = *getRootPtr(); -> rootCopy.bits = *getRootPtr();
+
+** Print code
+
+enum { dbg_histSize = 100 };
+extern std::array<uint64_t, dbg_histSize> dbg_constRootHist, dbg_mutRootHist, dbg_rootWriteHist;
+extern uint64_t dbg_constRootIndex, dbg_mutRootIndex, dbg_rootWriteIndex;
+
+{
+    uint64_t index = __sync_fetch_and_add(&dbg_mutRootIndex, 1);
+    dbg_mutRootHist[index % dbg_histSize] = rootCopy.data;
+}
+
+** Find symbols
+remi@dev2:~/code/freq-test/build/x86_64/bin$ objdump -tC libfrequency_cap.so | grep current
+00000000000290a0  w    F .text	0000000000000241              Datacratic::MMap::Trie::current() const
+0000000000028e20  w    F .text	0000000000000272              Datacratic::MMap::Trie::current()
+
+** Dump ASM
+remi@dev2:~/code/freq-test/build/x86_64/bin$ objdump -dClSM intel --start-address=0x28e20 --stop-address=0x29092 libfrequency_cap.so > ~/code/freq-test/current_inline_old.asm
+
+** setRoot's good ASM
+cmp_xchg<long unsigned int>():
+/home/remi/code/freq-test/./jml/arch/cmp_xchg.h:32
+                      "     setz    %[result]\n\t"
+                      : "+&a" (old),
+                        [result] "=q" (result)
+                      : [val] "r" (&val),
+                        [new_val] "r" (new_val)
+                      : "cc", "memory");
+   41538:	48 8b 43 10          	mov    rax,QWORD PTR [rbx+0x10]
+   4153c:	f0 4d 0f b1 26       	lock cmpxchg QWORD PTR [r14],r12
+   41541:	41 0f 94 c6          	sete   r14b
+
+** setRoot's bad ASM
+cmp_xchg<Datacratic::MMap::TriePtr>():
+/home/remi/code/freq-test/./jml/arch/cmp_xchg.h:32
+                      "     setz    %[result]\n\t"
+                      : "+&a" (old),
+                        [result] "=q" (result)
+                      : [val] "r" (&val),
+                        [new_val] "r" (new_val)
+                      : "cc", "memory");
+   41538:	49 c1 e5 07          	shl    r13,0x7
+   4153c:	41 83 e4 7f          	and    r12d,0x7f
+_ZNK7Datacratic4MMap4Trie10getRootPtrEv():
+/home/remi/code/freq-test/./mmap/memory_region.h:292
+            grow(startOffset + length);
+
+#if !DASDB_SW_PAGE_TRACKING
+        return RangeT<T>(
+                reinterpret_cast<T *>(start() + startOffset), numObjects);
+   41540:	4d 03 7e 10          	add    r15,QWORD PTR [r14+0x10]
+cmp_xchg<Datacratic::MMap::TriePtr>():
+/home/remi/code/freq-test/./jml/arch/cmp_xchg.h:32
+   41544:	48 8b 43 10          	mov    rax,QWORD PTR [rbx+0x10]
+   41548:	4d 09 ec             	or     r12,r13
+   4154b:	f0 4d 0f b1 27       	lock cmpxchg QWORD PTR [r15],r12
+   41550:	41 0f 94 c4          	sete   r12b
+
+** current()'s correct ASM
+_ZN7Datacratic4MMap4Trie7currentEv():
+/home/remi/code/freq-test/./mmap/mmap_trie.h:667
+
+        TriePtr rootCopy;
+        MMAP_PIN_REGION(area_->region())
+        {
+            rootCopy.bits = *getRootPtr();
+   29ba7:	48 8b 43 10          	mov    rax,QWORD PTR [rbx+0x10]
+
+** current()'s bad ASM 
+_ZNK7Datacratic4MMap4Trie10getRootPtrEv():
+/home/remi/code/freq-test/./mmap/mmap_trie.h:667
+
+        TriePtr rootCopy;
+        MMAP_PIN_REGION(area_->region())
+        {
+            rootCopy = *getRootPtr();
+   28e8b:	41 be 3f 00 00 00    	mov    r14d,0x3f
+~SharedGuard():
+/home/remi/code/freq-test/./mmap/gc_lock.h:277
+   28e91:	31 f6                	xor    esi,esi
+_ZNK7Datacratic4MMap4Trie10getRootPtrEv():
+/home/remi/code/freq-test/./mmap/mmap_trie.h:667
+   28e93:	44 0f b6 38          	movzx  r15d,BYTE PTR [rax]
+   28e97:	48 8b 18             	mov    rbx,QWORD PTR [rax]
+   28e9a:	48 c1 eb 07          	shr    rbx,0x7
+   28e9e:	45 21 fe             	and    r14d,r15d
+   28ea1:	41 c0 ef 06          	shr    r15b,0x6
+   28ea5:	41 83 e7 01          	and    r15d,0x1
+
+* Footnotes
+
+[fn:1] Not really but the original name is terrible. I'm taking creative
+liberties here :)
+

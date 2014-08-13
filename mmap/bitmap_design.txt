@@ -1,0 +1,154 @@
+Design of hierarchical bitmaps
+
+Goals:
+- Bitmap: one bit of information per entry
+- Hierarchical design: can be cascaded together to create one as big
+  as you want
+- Multithread safe with no locking and minimal spinning
+- Safe even if one thread dies without cleaning up (won't deadlock)
+
+Operations:
+- Mark bit as deallocated
+- Find an unallocated bit
+- Count allocated bits
+
+
+Deadlock scenarios
+
+...
+
+thread1    thread2        bits     full
+---------------------------------------
+                          1 1       1
+dealloc                   0 1       1
+           alloc          1 1       1
+           full           1 1       ?!!!! boom
+not full                  1 1       0
+
+
+
+thread1    thread2        bits     full
+---------------------------------------
+                          0 1       0
+alloc                     1 1       0
+           dealloc        1 0       0
+           not full       1 0       ?!!!! boom
+not full                  1 1       0
+
+
+thread1    thread2        bits     full
+---------------------------------------
+                          0 0       0
+alloc                     1 0       0
+           alloc          1 1       0
+dealloc                   0 1       0
+not full                  0 1       ?!!!! boom
+           full           0 1       0
+
+
+thr1  thr2    thr3  thr4    thr5            bits    full
+--------------------------------------------------------
+                                            0 1 1    0
+alloc                                       1 1 1    0
+      dealloc                               1 0 1    0
+              alloc                         1 1 1    0
+                    dealloc                 1 1 0    0
+                            alloc           1 1 1    0
+full                                        1 1 1    1
+              full                          1 1 1    2 (boom)
+                            full            1 1 1    3
+      not full                              1 1 1    2
+                    not full                1 1 1    1
+
+
+thr1  thr2    thr3  thr4    thr5            bits    set   rst    full
+---------------------------------------------------------------------
+                                            1 1 1    0     0      1
+dealloc                                     0 1 1    0     1      1
+        alloc                               1 1 1    0     0      1
+              dealloc                       1 0 1    0     1      1
+                    alloc                   1 1 1    0     0      1
+                           dealloc          1 1 0    0     1      1
+try rst                                     1 1 0    0     0      1
+not full                                    1 1 0    0     0      0
+
+thr1  thr2    thr3  thr4    thr5            bits    set   rst    full
+---------------------------------------------------------------------
+                                            1 1 1    0     0      1
+dealloc                                     0 1 1    0     1      1
+        alloc                               1 1 1    0     0      1
+              dealloc                       1 0 1    0     1      1
+try rst                                     1 0 1    0     0      1
+not full                                    1 0 1    0     0      0
+                    alloc                   1 1 1    1     0      0
+                           dealloc          1 1 0    0     0      0
+                    try set                 1 1 0    0     0      0
+
+
+*** WE HAVE A PARITY PROBLEM; WHAT ABOUT SIMPLY COMPLEMENTING THE UNDERLYING
+    FULL BIT WHEN WE CHANGE FULL STATE? ***
+
+Order-independent (but non-idempotent) operations:
+- Increment/decrement
+- Toggle
+
+Order-dependent (but idempotent) operations:
+- Set/reset
+
+We need an order independent but idempotent operation.
+
+If full was a byte, and full > 0 meant full and full <= 0 meant empty, then
+we would have what we wanted.
+
+Full however is a bit.
+
+So we have to block so that only one thing can modify the bit at a time.
+
+- If it's full after allocation, then block until the higher order bit is
+  set
+- If it's no longer full after deallocation, then block until the higher
+  order bit is cleared
+
+To allocate:
+1.  Set bit and lock (in same operation) [spin until possible]
+2.  reset higher order bit (and so on recursively)
+3.  unlock
+
+
+
+So algorithm is:
+Set bit n
+- If bit is already set, then ???
+- Set bit
+- If setting bit would make it full, then also increment full count
+- If full count goes from 0 to 1 then set bit at next level
+
+Reset bit n
+- If bit is already not set, then ???
+- Reset bit
+- If resetting bit moves from full to not full, then also decrement full cnt
+- If full count goes from 1 to 0 then reset bit at next level
+
+
+Solution 1: lock bit
+  - Allocating or deallocating a bit that doesn't change fullness can be
+    done at any time
+  - Allocating or deallocating a bit that changes fullness requires a three
+    step process:
+    1.  Modify the bit *and* set a "full" lock bit atomically
+    2.  Push down fullness to the next level
+    3.  Unlock the "full" lock bit
+
+Solution 2: spinning
+  - Continue spinning on the full bit until it's changed back
+
+
+Basic setup:
+- 64 leaf bits
+- 1 root bit
+
+root bit is 1 iff 64 leaf bits are set
+
+if we mark full and it's not: memory leak (big problem)
+if we mark not full and it is: no big problem; we redo
+
